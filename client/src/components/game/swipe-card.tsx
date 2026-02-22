@@ -8,7 +8,7 @@ import { format_price, format_sol } from "@/lib/format";
 type swipe_card_props = {
   round: round_view;
   amount_sol: number;
-  on_decision: (side: decision_side) => void;
+  on_decision: (side: decision_side) => Promise<boolean>;
   disabled: boolean;
 };
 
@@ -26,15 +26,24 @@ export const SwipeCard = ({ round, amount_sol, on_decision, disabled }: swipe_ca
     const v_x = info.velocity.x;
     const y = info.offset.y;
 
+    let decision_made: decision_side | null = null;
+
     if (x > threshold || v_x > velocity_threshold) {
       await controls.start({ x: 500, opacity: 0, transition: { duration: 0.3 } });
-      on_decision("yes");
+      decision_made = "yes";
     } else if (x < -threshold || v_x < -velocity_threshold) {
       await controls.start({ x: -500, opacity: 0, transition: { duration: 0.3 } });
-      on_decision("no");
+      decision_made = "no";
     } else if (y > 120) {
       await controls.start({ y: 500, opacity: 0, transition: { duration: 0.3 } });
-      on_decision("skip");
+      decision_made = "skip";
+    }
+
+    if (decision_made) {
+      const success = await on_decision(decision_made);
+      if (!success) {
+        controls.start({ x: 0, y: 0, opacity: 1, transition: { type: "spring", stiffness: 300, damping: 20 } });
+      }
     } else {
       controls.start({ x: 0, y: 0, transition: { type: "spring", stiffness: 300, damping: 20 } });
     }
@@ -54,15 +63,18 @@ export const SwipeCard = ({ round, amount_sol, on_decision, disabled }: swipe_ca
       if (event.key === "ArrowLeft") {
         event.preventDefault();
         await controls.start({ x: -500, opacity: 0, transition: { duration: 0.3 } });
-        on_decision("no");
+        const success = await on_decision("no");
+        if (!success) controls.start({ x: 0, y: 0, opacity: 1, transition: { type: "spring", stiffness: 300, damping: 20 } });
       } else if (event.key === "ArrowRight") {
         event.preventDefault();
         await controls.start({ x: 500, opacity: 0, transition: { duration: 0.3 } });
-        on_decision("yes");
+        const success = await on_decision("yes");
+        if (!success) controls.start({ x: 0, y: 0, opacity: 1, transition: { type: "spring", stiffness: 300, damping: 20 } });
       } else if (event.key === "ArrowDown") {
         event.preventDefault();
         await controls.start({ y: 500, opacity: 0, transition: { duration: 0.3 } });
-        on_decision("skip");
+        const success = await on_decision("skip");
+        if (!success) controls.start({ x: 0, y: 0, opacity: 1, transition: { type: "spring", stiffness: 300, damping: 20 } });
       }
     };
 

@@ -154,30 +154,30 @@ export const SingleGame = () => {
   }, [wallet, session_token, authenticate, setVisible]);
 
   const submit_decision = useCallback(
-    async (side: decision_side) => {
+    async (side: decision_side): Promise<boolean> => {
       if (!active_round) {
         set_status("no active round");
-        return;
+        return false;
       }
 
       if (side === "skip") {
         set_skipped_round_ids(prev => new Set(prev).add(active_round.id));
         set_status("skipped round");
-        return;
+        return true;
       }
 
       set_submitting(true);
       try {
         const token = await ensure_wallet_and_auth();
         if (!token || !wallet.publicKey || !wallet.signTransaction) {
-          return;
+          return false;
         }
 
         const amount_lamports = Math.max(0, Math.round(amount_sol * 1_000_000_000));
 
         if (amount_lamports <= 0) {
           set_status("amount must be greater than zero for yes/no");
-          return;
+          return false;
         }
 
         let tx_signature: string | null = null;
@@ -231,8 +231,10 @@ export const SingleGame = () => {
         set_status(`submitted ${side} (${tx_signature.slice(0, 8)}...)`);
         set_skipped_round_ids(prev => new Set(prev).add(active_round.id));
         await load_data();
+        return true;
       } catch (error: any) {
         set_status(error.message || "submit failed");
+        return false;
       } finally {
         set_submitting(false);
       }

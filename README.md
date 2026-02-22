@@ -2,7 +2,7 @@
 
 ## About
 
-`ubalance` is a Solana devnet prediction market prototype that uses MagicBlock Ephemeral Rollups (ER) for fast prediction writes and periodically settles round state back to base Solana.
+`ubalance` is a swipe-based prediction market on Solana that uses MagicBlock Ephemeral Rollups (ER) for fast prediction writes and periodically settles round state back to base Solana.
 
 Main characteristics:
 
