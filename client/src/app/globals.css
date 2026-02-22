@@ -1,7 +1,19 @@
 @import "tailwindcss";
 
 :root {
-  color-scheme: light;
+  --bg: #0b0f0e;
+  --surface: #111513;
+  --muted-surface: #171b19;
+  --border: #1e2422;
+  --text: #e7efe9;
+  --muted: #9eaba4;
+  --accent: #b9f6c9;
+  --accent-600: #89eeb0;
+  --accent-700: #62df98;
+  --accent-ink: #0a1611;
+  --muted-strong: #b7c3bd;
+
+  color-scheme: dark;
 }
 
 * {
@@ -16,8 +28,11 @@ body {
 }
 
 body {
-  font-family: "Space Grotesk", "Satoshi", "Inter", sans-serif;
-  color: #0f172a;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 button,

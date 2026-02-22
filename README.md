@@ -35,6 +35,23 @@ Client: `http://localhost:3000`
 
 The backend uses this admin signer to initialize markets, open/lock/resolve rounds, and execute ER lifecycle transactions.
 
+## smoke lifecycle test
+
+Use this to run one end-to-end ER round check:
+
+```bash
+cd server
+npm run generate-smoke-keypair
+npm run smoke:lifecycle -- --iterations 1
+```
+
+Key files:
+
+- `server/.keys/ubalance-smoke-user-keypair.json`
+- `server/.keys/ubalance-smoke-user-pubkey.txt`
+
+The smoke wallet must be funded on devnet (default minimum: `0.05` SOL).
+
 ## data sources
 
 - Oracle source: Pyth Hermes (`server/src/features/oracle/oracle.service.ts`), symbols like `Crypto.BTC/USD`.

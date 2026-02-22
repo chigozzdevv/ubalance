@@ -1,16 +1,14 @@
 import bs58 from "bs58";
-import { readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
 import {
   DELEGATION_PROGRAM_ID,
-  GetCommitmentSignature,
-  createCommitAndUndelegateInstruction
+  GetCommitmentSignature
 } from "@magicblock-labs/ephemeral-rollups-sdk";
-import { Connection, Keypair, PublicKey, Transaction, type TransactionInstruction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { env } from "@/config/env";
 import { app_error } from "@/shared/app-error";
 import {
   create_initialize_market_instruction,
+  create_commit_and_undelegate_round_instruction,
   create_lock_round_instruction,
   create_open_round_instruction,
   create_program_delegate_pda_instruction,
@@ -28,7 +26,6 @@ type market_chain_input = {
 
 type round_chain_input = {
   market_index: number;
-  round_number: number;
   reference_price: number;
   open_at_ms: number;
   close_at_ms: number;
@@ -64,26 +61,8 @@ const parse_secret_key = (value: string): Uint8Array => {
   return bs58.decode(trimmed);
 };
 
-const parse_secret_key_from_file = (keypair_path: string): Uint8Array => {
-  const trimmed = keypair_path.trim();
-  if (!trimmed) {
-    throw new app_error("UBALANCE_ADMIN_KEYPAIR_PATH is empty", 500);
-  }
-
-  const resolved_path = isAbsolute(trimmed) ? trimmed : resolve(process.cwd(), trimmed);
-  const raw = readFileSync(resolved_path, "utf8");
-  const parsed = JSON.parse(raw) as number[];
-  if (!Array.isArray(parsed) || parsed.length < 64) {
-    throw new app_error("invalid keypair file format", 500);
-  }
-  return Uint8Array.from(parsed);
-};
-
 const load_admin_secret_key = (): Uint8Array => {
-  if (env.UBALANCE_ADMIN_KEYPAIR_PATH) {
-    return parse_secret_key_from_file(env.UBALANCE_ADMIN_KEYPAIR_PATH);
-  }
-  return parse_secret_key(env.UBALANCE_ADMIN_SECRET_KEY ?? "");
+  return parse_secret_key(env.UBALANCE_ADMIN_SECRET_KEY);
 };
 
 const sleep = async (ms: number): Promise<void> => {
@@ -149,8 +128,12 @@ export class chain_admin_service {
       return null;
     }
 
-    const market_pda = this.derive_market_pda(market_index);
-    const round_pda = derive_round_pda(this.program_id, market_pda, latest_round_number);
+    return this.get_round_snapshot({ market_index, round_number: latest_round_number });
+  }
+
+  async get_round_snapshot(input: { market_index: number; round_number: number }): Promise<latest_round_snapshot | null> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
     const round_account = await this.base_connection.getAccountInfo(round_pda, "confirmed");
     if (!round_account) {
       return null;
@@ -193,30 +176,63 @@ export class chain_admin_service {
       is_active: true
     });
 
-    const signature = await this.send_base_transaction([initialize_ix, activate_ix], "initialize market");
-    return { market_pda: market_pda.toBase58(), initialize_tx_signature: signature };
+    try {
+      const signature = await this.send_base_transaction([initialize_ix, activate_ix], "initialize market");
+      return { market_pda: market_pda.toBase58(), initialize_tx_signature: signature };
+    } catch (error) {
+      const existing_after_error = await this.base_connection.getAccountInfo(market_pda, "confirmed");
+      if (existing_after_error) {
+        return { market_pda: market_pda.toBase58(), initialize_tx_signature: null };
+      }
+      throw error;
+    }
   }
 
-  async open_round(input: round_chain_input): Promise<{ market_pda: string; round_pda: string; open_tx_signature: string }> {
+  async open_round(input: round_chain_input): Promise<{
+    market_pda: string;
+    round_pda: string;
+    round_number: number;
+    open_tx_signature: string;
+  }> {
     const market_pda = this.derive_market_pda(input.market_index);
-    const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
+    let round_number = await this.get_next_round_number(input.market_index);
+    const max_attempts = 3;
+    let last_error: unknown = null;
 
-    const open_round_ix = create_open_round_instruction({
-      program_id: this.program_id,
-      admin: this.admin.publicKey,
-      market_pda,
-      round_pda,
-      reference_price: to_lamports_price(input.reference_price),
-      open_at_ts: Math.floor(input.open_at_ms / 1000),
-      close_at_ts: Math.floor(input.close_at_ms / 1000)
-    });
+    for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
+      const round_pda = derive_round_pda(this.program_id, market_pda, round_number);
+      const open_round_ix = create_open_round_instruction({
+        program_id: this.program_id,
+        admin: this.admin.publicKey,
+        market_pda,
+        round_pda,
+        reference_price: to_lamports_price(input.reference_price),
+        open_at_ts: Math.floor(input.open_at_ms / 1000),
+        close_at_ts: Math.floor(input.close_at_ms / 1000)
+      });
 
-    const open_tx_signature = await this.send_base_transaction([open_round_ix], "open round");
-    return {
-      market_pda: market_pda.toBase58(),
-      round_pda: round_pda.toBase58(),
-      open_tx_signature
-    };
+      try {
+        const open_tx_signature = await this.send_base_transaction([open_round_ix], "open round");
+        return {
+          market_pda: market_pda.toBase58(),
+          round_pda: round_pda.toBase58(),
+          round_number,
+          open_tx_signature
+        };
+      } catch (error) {
+        last_error = error;
+        const formatted = this.format_error(error);
+        const retryable = this.is_retryable_open_round_error(formatted);
+        if (!retryable || attempt >= max_attempts) {
+          throw new app_error(`open round failed: ${formatted}`, 502);
+        }
+
+        round_number = await this.get_next_round_number(input.market_index);
+        await sleep(250 * attempt);
+      }
+    }
+
+    throw new app_error(`open round failed: ${this.format_error(last_error)}`, 502);
   }
 
   async is_round_delegated(input: { market_index: number; round_number: number }): Promise<boolean> {
@@ -256,7 +272,12 @@ export class chain_admin_service {
     const market_pda = this.derive_market_pda(input.market_index);
     const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
 
-    const commit_and_undelegate_round_ix = createCommitAndUndelegateInstruction(this.admin.publicKey, [round_pda]);
+    const commit_and_undelegate_round_ix = create_commit_and_undelegate_round_instruction({
+      program_id: this.program_id,
+      payer: this.admin.publicKey,
+      market_pda,
+      round_pda
+    });
     const er_tx_signature = await this.send_er_transaction([commit_and_undelegate_round_ix], "commit and undelegate round");
 
     let base_commit_tx_signature: string | null = null;
@@ -489,5 +510,15 @@ export class chain_admin_service {
       return error;
     }
     return "unknown error";
+  }
+
+  private is_retryable_open_round_error(error_message: string): boolean {
+    const text = error_message.toLowerCase();
+    return (
+      text.includes("constraintseeds") ||
+      text.includes("error number: 2006") ||
+      text.includes("already in use") ||
+      text.includes("account address already in use")
+    );
   }
 }

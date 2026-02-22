@@ -13,9 +13,12 @@ import { env } from "@/config/env";
 
 const default_history_limit = 20;
 const max_history_limit = 100;
+const transition_batch_size = 4;
+const delegation_scan_batch_size = 6;
 
 export class rounds_service {
   private refresh_in_progress: Promise<void> | null = null;
+  private last_refresh_started_at_ms = 0;
 
   constructor(
     private readonly mongo: mongo_service,
@@ -30,13 +33,15 @@ export class rounds_service {
   }
 
   async list_active(): Promise<round_view[]> {
-    await this.refresh_round_states();
+    await this.mongo.ensure_ready();
+    this.schedule_refresh();
     const rows = await this.mongo.rounds_collection.find({ status: "predicting" }).sort({ close_at_ms: -1 }).toArray();
     return this.hydrate_views(rows);
   }
 
   async list_history(limit = default_history_limit, market_slug?: string): Promise<round_view[]> {
-    await this.refresh_round_states();
+    await this.mongo.ensure_ready();
+    this.schedule_refresh();
     const safe_limit = Math.max(1, Math.min(limit, max_history_limit));
     const filter: Record<string, any> = { status: { $ne: "predicting" } };
     if (market_slug) {
@@ -53,7 +58,8 @@ export class rounds_service {
   }
 
   async get_by_id(round_id: string): Promise<round_view> {
-    await this.refresh_round_states();
+    await this.mongo.ensure_ready();
+    this.schedule_refresh();
     const round_document = await this.mongo.rounds_collection.findOne({ id: round_id });
     if (!round_document) {
       throw new app_error("round not found", 404);
@@ -74,13 +80,14 @@ export class rounds_service {
     amount_lamports: number,
     tx_signature: string | null
   ): Promise<{ action: round_action; round: round_view }> {
-    await this.refresh_round_states();
+    await this.mongo.ensure_ready();
+    this.schedule_refresh();
 
     const round_document = await this.mongo.rounds_collection.findOne({ id: round_id });
     if (!round_document) {
       throw new app_error("round not found", 404);
     }
-    if (round_document.status !== "predicting") {
+    if (round_document.status !== "predicting" || Date.now() >= Number(round_document.close_at_ms)) {
       throw new app_error("round is locked", 409);
     }
 
@@ -189,6 +196,25 @@ export class rounds_service {
     await this.refresh_in_progress;
   }
 
+  private schedule_refresh(): void {
+    const now = Date.now();
+    if (this.refresh_in_progress) {
+      return;
+    }
+    if (now - this.last_refresh_started_at_ms < 3_000) {
+      return;
+    }
+
+    this.last_refresh_started_at_ms = now;
+    this.refresh_in_progress = this.refresh_round_states_internal()
+      .catch((error) => {
+        console.error("failed refreshing round states", error);
+      })
+      .finally(() => {
+        this.refresh_in_progress = null;
+      });
+  }
+
   private async refresh_round_states_internal(): Promise<void> {
     await this.ensure_predicting_rounds();
     await this.lock_expired_rounds();
@@ -221,19 +247,17 @@ export class rounds_service {
   }
 
   private async create_new_round(market_item: market): Promise<void> {
-    const round_number = await this.chain_admin.get_next_round_number(market_item.market_index);
     const open_at_ms = Date.now();
     const close_at_ms = open_at_ms + market_item.timeframe_minutes * 60_000;
     const reference_price = await this.oracle_service.get_latest_price(market_item.oracle_symbol);
-    const round_id = `${market_item.slug}-${round_number}`;
 
     const opened = await this.chain_admin.open_round({
       market_index: market_item.market_index,
-      round_number,
       reference_price,
       open_at_ms,
       close_at_ms
     });
+    const round_id = `${market_item.slug}-${opened.round_number}`;
 
     const now = Date.now();
 
@@ -242,7 +266,7 @@ export class rounds_service {
       id: round_id,
       market_slug: market_item.slug,
       market_pda: opened.market_pda,
-      round_number,
+      round_number: opened.round_number,
       round_pda: opened.round_pda,
       status: "predicting",
       reference_price,
@@ -265,7 +289,7 @@ export class rounds_service {
       updated_at_ms: now
     });
 
-    await this.ensure_round_delegated(market_item.market_index, round_number);
+    await this.ensure_round_delegated(market_item.market_index, opened.round_number);
   }
 
   private async recover_chain_predicting_round(market_item: market): Promise<boolean> {
@@ -318,6 +342,8 @@ export class rounds_service {
   private async ensure_market_rounds_delegated(market_item: market): Promise<void> {
     const predicting_rounds = await this.mongo.rounds_collection
       .find({ market_slug: market_item.slug, status: "predicting" })
+      .sort({ round_number: -1 })
+      .limit(delegation_scan_batch_size)
       .toArray();
 
     for (const row of predicting_rounds) {
@@ -353,6 +379,7 @@ export class rounds_service {
     const expired_rounds = await this.mongo.rounds_collection
       .find({ status: "predicting", close_at_ms: { $lte: now } })
       .sort({ close_at_ms: 1 })
+      .limit(transition_batch_size)
       .toArray();
 
     for (const row of expired_rounds) {
@@ -364,10 +391,19 @@ export class rounds_service {
         });
 
         if (delegated) {
-          await this.chain_admin.commit_and_undelegate_round({
-            market_index,
-            round_number: Number(row.round_number)
-          });
+          try {
+            await this.chain_admin.commit_and_undelegate_round({
+              market_index,
+              round_number: Number(row.round_number)
+            });
+          } catch (error) {
+            const delegated_after_error = await this.chain_admin
+              .is_round_delegated({ market_index, round_number: Number(row.round_number) })
+              .catch(() => false);
+            if (delegated_after_error) {
+              throw error;
+            }
+          }
         }
 
         const lock_tx_signature = await this.chain_admin.lock_round({
@@ -391,6 +427,10 @@ export class rounds_service {
           }
         );
       } catch (error) {
+        if (this.is_invalid_state_error(error)) {
+          await this.reconcile_round_state_from_chain(row).catch(() => undefined);
+          continue;
+        }
         console.error(`failed locking round ${row.id}`, error);
       }
     }
@@ -404,6 +444,7 @@ export class rounds_service {
         resolve_at_ms: { $ne: null, $lte: now }
       })
       .sort({ resolve_at_ms: 1 })
+      .limit(transition_batch_size)
       .toArray();
 
     for (const row of locked_rounds) {
@@ -439,9 +480,60 @@ export class rounds_service {
           }
         );
       } catch (error) {
+        if (this.is_invalid_state_error(error)) {
+          await this.reconcile_round_state_from_chain(row).catch(() => undefined);
+          continue;
+        }
         console.error(`failed resolving round ${row.id}`, error);
       }
     }
+  }
+
+  private is_invalid_state_error(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    return message.includes("Error Code: InvalidState") || message.includes("custom program error: 0x1771");
+  }
+
+  private async reconcile_round_state_from_chain(row: round_document): Promise<void> {
+    const market_index = await this.get_market_index(row.market_slug);
+    const snapshot = await this.chain_admin.get_round_snapshot({
+      market_index,
+      round_number: Number(row.round_number)
+    });
+    if (!snapshot) {
+      return;
+    }
+
+    const now = Date.now();
+    const base_set: Record<string, unknown> = {
+      market_pda: snapshot.market_pda,
+      round_pda: snapshot.round_pda,
+      status: snapshot.status,
+      reference_price: snapshot.reference_price,
+      settlement_price: snapshot.settlement_price,
+      winning_side: snapshot.winning_side,
+      open_at_ms: snapshot.open_at_ms,
+      close_at_ms: snapshot.close_at_ms,
+      updated_at_ms: now
+    };
+
+    if (snapshot.status === "predicting") {
+      base_set.locked_at_ms = null;
+      base_set.resolve_at_ms = null;
+    } else if (snapshot.status === "locked") {
+      base_set.locked_at_ms = row.locked_at_ms ?? now;
+      base_set.resolve_at_ms = row.resolve_at_ms ?? now + env.ROUND_RESOLVE_DELAY_SECONDS * 1000;
+    } else {
+      base_set.locked_at_ms = row.locked_at_ms ?? now;
+      base_set.resolve_at_ms = row.resolve_at_ms ?? now;
+    }
+
+    await this.mongo.rounds_collection.updateOne(
+      { id: row.id },
+      {
+        $set: base_set
+      }
+    );
   }
 
   private async hydrate_views(round_documents: round_document[]): Promise<round_view[]> {

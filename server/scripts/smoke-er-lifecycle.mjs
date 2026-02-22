@@ -6,12 +6,12 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
+import { DELEGATION_PROGRAM_ID } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   Connection,
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
-  SystemProgram,
   Transaction,
   TransactionInstruction,
   sendAndConfirmTransaction
@@ -36,6 +36,7 @@ const parse_args = () => {
     side: env_or("SMOKE_SIDE", "yes"),
     amount_sol: Number(env_or("SMOKE_AMOUNT_SOL", "0.01")),
     min_balance_sol: Number(env_or("SMOKE_MIN_BALANCE_SOL", "0.05")),
+    min_admin_balance_sol: Number(env_or("SMOKE_MIN_ADMIN_BALANCE_SOL", "0.05")),
     min_round_window_ms: Number(env_or("SMOKE_MIN_ROUND_WINDOW_MS", "25000")),
     poll_ms: Number(env_or("SMOKE_POLL_MS", "3000")),
     timeout_ms: Number(env_or("SMOKE_TIMEOUT_MS", "420000")),
@@ -105,7 +106,7 @@ const health_url = `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}/he
 const er_rpc_url = env_or("ER_RPC_URL", "https://devnet-us.magicblock.app");
 const er_ws_url = env_or("ER_WS_URL", "wss://devnet-us.magicblock.app");
 const base_rpc_url = env_or("SOLANA_RPC_URL", "https://api.devnet.solana.com");
-const program_id = new PublicKey(env_or("UBALANCE_PROGRAM_ID", "EepYTCc1WZMzXLhLrXy2NwKAAJxM1FH6tKfVsRnhwo1U"));
+const program_id = new PublicKey(env_or("UBALANCE_PROGRAM_ID", "FkZVTshsawSNHYzxFZFfdBJUbLxvQJVhWtJqi8FgunFG"));
 
 const log = (message) => {
   const timestamp = new Date().toISOString();
@@ -132,6 +133,34 @@ const load_keypair = async (keypair_path) => {
     throw new Error("invalid smoke wallet keypair format");
   }
   return Keypair.fromSecretKey(Uint8Array.from(parsed));
+};
+
+const load_admin_public_key = () => {
+  const raw = env_or("UBALANCE_ADMIN_SECRET_KEY", "");
+  if (!raw) {
+    throw new Error("UBALANCE_ADMIN_SECRET_KEY is required for server lifecycle transactions");
+  }
+
+  const trimmed = raw.trim();
+  const secret = trimmed.startsWith("[")
+    ? Uint8Array.from(JSON.parse(trimmed))
+    : bs58.decode(trimmed);
+
+  return Keypair.fromSecretKey(secret).publicKey;
+};
+
+const load_admin_keypair = () => {
+  const raw = env_or("UBALANCE_ADMIN_SECRET_KEY", "");
+  if (!raw) {
+    throw new Error("UBALANCE_ADMIN_SECRET_KEY is required for ER fee payer");
+  }
+
+  const trimmed = raw.trim();
+  const secret = trimmed.startsWith("[")
+    ? Uint8Array.from(JSON.parse(trimmed))
+    : bs58.decode(trimmed);
+
+  return Keypair.fromSecretKey(secret);
 };
 
 const parse_json = async (response) => {
@@ -286,22 +315,15 @@ const encode_u64 = (value) => {
   return buffer;
 };
 
-const derive_position_pda = (round_pubkey, user_pubkey) => {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("position"), round_pubkey.toBuffer(), user_pubkey.toBuffer()],
-    program_id
-  )[0];
-};
-
 const place_prediction_on_er = async (wallet_keypair, round, side, amount_lamports) => {
   const connection = new Connection(er_rpc_url, {
     commitment: "confirmed",
     wsEndpoint: er_ws_url
   });
+  const admin_keypair = load_admin_keypair();
 
   const market_pda = new PublicKey(round.marketPda);
   const round_pda = new PublicKey(round.roundPda);
-  const position_pda = derive_position_pda(round_pda, wallet_keypair.publicKey);
 
   const data = Buffer.concat([
     instruction_discriminator("place_prediction"),
@@ -314,15 +336,17 @@ const place_prediction_on_er = async (wallet_keypair, round, side, amount_lampor
     keys: [
       { pubkey: wallet_keypair.publicKey, isWritable: true, isSigner: true },
       { pubkey: market_pda, isWritable: false, isSigner: false },
-      { pubkey: round_pda, isWritable: true, isSigner: false },
-      { pubkey: position_pda, isWritable: true, isSigner: false },
-      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
+      { pubkey: round_pda, isWritable: true, isSigner: false }
     ],
     data
   });
 
-  const transaction = new Transaction().add(place_prediction_ix);
-  const tx_signature = await sendAndConfirmTransaction(connection, transaction, [wallet_keypair], {
+  const transaction = new Transaction({ feePayer: admin_keypair.publicKey }).add(place_prediction_ix);
+  const signers = admin_keypair.publicKey.equals(wallet_keypair.publicKey)
+    ? [admin_keypair]
+    : [admin_keypair, wallet_keypair];
+
+  const tx_signature = await sendAndConfirmTransaction(connection, transaction, signers, {
     skipPreflight: true,
     commitment: "confirmed"
   });
@@ -345,6 +369,22 @@ const wait_for_round_status = async (round_id, expected_status, timeout_ms) => {
   throw new Error(`timed out waiting for round ${round_id} to reach status ${expected_status}`);
 };
 
+const wait_for_round_delegated = async (round_pda_base58, timeout_ms) => {
+  const base_connection = new Connection(base_rpc_url, "confirmed");
+  const round_pda = new PublicKey(round_pda_base58);
+  const started_at = Date.now();
+
+  while (Date.now() - started_at < timeout_ms) {
+    const account = await base_connection.getAccountInfo(round_pda, "confirmed");
+    if (account && account.owner.equals(DELEGATION_PROGRAM_ID)) {
+      return;
+    }
+    await sleep(options.poll_ms);
+  }
+
+  throw new Error(`timed out waiting for delegation of round ${round_pda_base58}`);
+};
+
 const ensure_wallet_funded = async (wallet_keypair) => {
   const base_connection = new Connection(base_rpc_url, "confirmed");
   const balance = await base_connection.getBalance(wallet_keypair.publicKey, "confirmed");
@@ -359,6 +399,21 @@ const ensure_wallet_funded = async (wallet_keypair) => {
   log(`smoke wallet balance: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
 };
 
+const ensure_admin_wallet_funded = async () => {
+  const base_connection = new Connection(base_rpc_url, "confirmed");
+  const admin_public_key = load_admin_public_key();
+  const balance = await base_connection.getBalance(admin_public_key, "confirmed");
+  const minimum = Math.floor(options.min_admin_balance_sol * LAMPORTS_PER_SOL);
+
+  if (balance < minimum) {
+    throw new Error(
+      `admin wallet ${admin_public_key.toBase58()} balance too low: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL, need >= ${options.min_admin_balance_sol.toFixed(4)} SOL`
+    );
+  }
+
+  log(`admin wallet balance: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+};
+
 const run_iteration = async (iteration_index, session_token, wallet_keypair) => {
   const round = await wait_for_predicting_round(
     options.market_slug,
@@ -370,6 +425,7 @@ const run_iteration = async (iteration_index, session_token, wallet_keypair) => 
   const amount_lamports = Math.max(1, Math.round(options.amount_sol * LAMPORTS_PER_SOL));
 
   log(`iteration ${iteration_index}: selected ${round_id} (${round.market.slug}), closes in ${Math.max(0, Math.round((Number(round.closeAtMs) - Date.now()) / 1000))}s`);
+  await wait_for_round_delegated(round.roundPda, options.timeout_ms);
 
   const tx_signature = await place_prediction_on_er(wallet_keypair, round, options.side, amount_lamports);
   log(`iteration ${iteration_index}: on-chain prediction tx ${tx_signature}`);
@@ -410,6 +466,7 @@ const main = async () => {
   log(`smoke wallet: ${wallet_keypair.publicKey.toBase58()}`);
 
   await ensure_wallet_funded(wallet_keypair);
+  await ensure_admin_wallet_funded();
 
   const server_handle = await maybe_start_server();
 

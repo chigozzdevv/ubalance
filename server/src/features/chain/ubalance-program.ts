@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
 import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
+import {
+  DELEGATION_PROGRAM_ID,
+  MAGIC_CONTEXT_ID,
+  MAGIC_PROGRAM_ID,
+  delegateBufferPdaFromDelegatedAccountAndOwnerProgram,
+  delegationMetadataPdaFromDelegatedAccount,
+  delegationRecordPdaFromDelegatedAccount
+} from "@magicblock-labs/ephemeral-rollups-sdk";
 
 const market_seed = Buffer.from("market");
 const round_seed = Buffer.from("round");
@@ -156,7 +164,6 @@ export const create_place_prediction_instruction = (args: {
   user: PublicKey;
   market_pda: PublicKey;
   round_pda: PublicKey;
-  position_pda: PublicKey;
   side: decision_side;
   amount_lamports: number;
 }): TransactionInstruction => {
@@ -171,11 +178,28 @@ export const create_place_prediction_instruction = (args: {
     keys: [
       { pubkey: args.user, isWritable: true, isSigner: true },
       { pubkey: args.market_pda, isWritable: false, isSigner: false },
-      { pubkey: args.round_pda, isWritable: true, isSigner: false },
-      { pubkey: args.position_pda, isWritable: true, isSigner: false },
-      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
+      { pubkey: args.round_pda, isWritable: true, isSigner: false }
     ],
     data
+  });
+};
+
+export const create_commit_and_undelegate_round_instruction = (args: {
+  program_id: PublicKey;
+  payer: PublicKey;
+  market_pda: PublicKey;
+  round_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.payer, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.round_pda, isWritable: true, isSigner: false },
+      { pubkey: MAGIC_PROGRAM_ID, isWritable: false, isSigner: false },
+      { pubkey: MAGIC_CONTEXT_ID, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("commit_and_undelegate_round")
   });
 };
 
@@ -224,13 +248,22 @@ export const create_program_delegate_pda_instruction = (args: {
   validator: PublicKey | null;
 }): TransactionInstruction => {
   const data = Buffer.concat([instruction_discriminator("delegate_pda"), encode_account_type(args.account_type)]);
+  const buffer_pda = delegateBufferPdaFromDelegatedAccountAndOwnerProgram(args.pda, args.program_id);
+  const delegation_record_pda = delegationRecordPdaFromDelegatedAccount(args.pda);
+  const delegation_metadata_pda = delegationMetadataPdaFromDelegatedAccount(args.pda);
 
   return new TransactionInstruction({
     programId: args.program_id,
     keys: [
+      { pubkey: buffer_pda, isWritable: true, isSigner: false },
+      { pubkey: delegation_record_pda, isWritable: true, isSigner: false },
+      { pubkey: delegation_metadata_pda, isWritable: true, isSigner: false },
       { pubkey: args.pda, isWritable: true, isSigner: false },
-      { pubkey: args.payer, isWritable: true, isSigner: true },
-      ...(args.validator ? [{ pubkey: args.validator, isWritable: false, isSigner: false }] : [])
+      { pubkey: args.payer, isWritable: false, isSigner: true },
+      ...(args.validator ? [{ pubkey: args.validator, isWritable: false, isSigner: false }] : []),
+      { pubkey: args.program_id, isWritable: false, isSigner: false },
+      { pubkey: DELEGATION_PROGRAM_ID, isWritable: false, isSigner: false },
+      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
     ],
     data
   });

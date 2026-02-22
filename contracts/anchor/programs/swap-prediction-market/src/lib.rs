@@ -3,7 +3,7 @@ use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::{commit_accounts, commit_and_undelegate_accounts};
 
-declare_id!("EepYTCc1WZMzXLhLrXy2NwKAAJxM1FH6tKfVsRnhwo1U");
+declare_id!("FkZVTshsawSNHYzxFZFfdBJUbLxvQJVhWtJqi8FgunFG");
 
 const MARKET_SEED: &[u8] = b"market";
 const ROUND_SEED: &[u8] = b"round";
@@ -84,36 +84,6 @@ pub mod ubalance_prediction_market {
             require!(amount_lamports > 0, ErrorCode::InvalidAmount);
         }
 
-        let position = &mut ctx.accounts.position;
-        if position.round == Pubkey::default() {
-            position.user = ctx.accounts.user.key();
-            position.round = round.key();
-            position.side = DecisionSide::Skip;
-            position.amount_lamports = 0;
-            position.claimed = false;
-        } else {
-            require_keys_eq!(position.user, ctx.accounts.user.key(), ErrorCode::Unauthorized);
-            require_keys_eq!(position.round, round.key(), ErrorCode::Unauthorized);
-        }
-
-        let previous_side = position.side.clone();
-        let previous = position.amount_lamports;
-
-        match previous_side {
-            DecisionSide::Yes => {
-                round.yes_total = round.yes_total.saturating_sub(previous);
-            }
-            DecisionSide::No => {
-                round.no_total = round.no_total.saturating_sub(previous);
-            }
-            DecisionSide::Skip => {
-                round.skip_total = round.skip_total.saturating_sub(previous);
-            }
-        }
-
-        position.side = side.clone();
-        position.amount_lamports = amount_lamports;
-
         match side {
             DecisionSide::Yes => {
                 round.yes_total = round.yes_total.saturating_add(amount_lamports);
@@ -122,7 +92,7 @@ pub mod ubalance_prediction_market {
                 round.no_total = round.no_total.saturating_add(amount_lamports);
             }
             DecisionSide::Skip => {
-                round.skip_total = round.skip_total.saturating_add(amount_lamports);
+                round.skip_total = round.skip_total.saturating_add(1);
             }
         }
         Ok(())
@@ -319,15 +289,6 @@ pub struct PlacePrediction<'info> {
         bump,
     )]
     pub round: Account<'info, Round>,
-    #[account(
-        init_if_needed,
-        payer = user,
-        space = 8 + Position::LEN,
-        seeds = [POSITION_SEED, round.key().as_ref(), user.key().as_ref()],
-        bump,
-    )]
-    pub position: Account<'info, Position>,
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]

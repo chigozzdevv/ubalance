@@ -7,7 +7,9 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "tsx src/server.ts",
-    "generate-admin-keypair": "node scripts/generate-admin-keypair.mjs"
+    "generate-admin-keypair": "node scripts/generate-admin-keypair.mjs",
+    "generate-smoke-keypair": "node scripts/generate-smoke-keypair.mjs",
+    "smoke:lifecycle": "node scripts/smoke-er-lifecycle.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^11.0.1",
