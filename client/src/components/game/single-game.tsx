@@ -262,7 +262,7 @@ export const SingleGame = () => {
               <div className="text-center text-xs font-bold uppercase tracking-widest text-[#9eaba4] mb-2">
                 round 1 of {active_queue.length}
               </div>
-              <SwipeCard round={active_round} amount_sol={amount_sol} on_decision={submit_decision} disabled={submitting} />
+              <SwipeCard key={active_round.id} round={active_round} amount_sol={amount_sol} on_decision={submit_decision} disabled={submitting} />
 
               <div className="grid grid-cols-3 gap-4 mx-auto w-full max-w-[360px]">
                 <button
