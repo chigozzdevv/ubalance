@@ -9,5 +9,6 @@ export const register_rounds_routes = async (
   fastify.get("/active", controller.list_active);
   fastify.get("/history", controller.list_history);
   fastify.get("/:roundId", controller.get_by_id);
+  fastify.post("/:roundId/actions/relay-prepare", { preHandler: require_auth }, controller.prepare_relay_action);
   fastify.post("/:roundId/actions", { preHandler: require_auth }, controller.upsert_action);
 };

@@ -73,6 +73,41 @@ export class rounds_service {
     return this.to_view(round_document, market_document);
   }
 
+  async prepare_relay_action(
+    round_id: string,
+    wallet: string,
+    side: decision_side,
+    amount_lamports: number
+  ): Promise<{
+    transaction_base64: string;
+    blockhash: string;
+    last_valid_block_height: number;
+    fee_payer: string;
+    amount_lamports: number;
+  }> {
+    await this.mongo.ensure_ready();
+    this.schedule_refresh();
+
+    const round_document = await this.get_active_round_or_throw(round_id);
+    const market_document = await this.get_round_market_or_throw(round_document);
+    const amount_to_store = this.normalize_amount_or_throw(side, amount_lamports);
+
+    await this.ensure_round_delegated(Number(market_document.market_index), Number(round_document.round_number));
+
+    const prepared = await this.chain_admin.prepare_prediction_transaction({
+      user_wallet: wallet,
+      market_pda: round_document.market_pda,
+      round_pda: round_document.round_pda,
+      side,
+      amount_lamports: amount_to_store
+    });
+
+    return {
+      ...prepared,
+      amount_lamports: amount_to_store
+    };
+  }
+
   async upsert_action(
     round_id: string,
     wallet: string,
@@ -83,22 +118,8 @@ export class rounds_service {
     await this.mongo.ensure_ready();
     this.schedule_refresh();
 
-    const round_document = await this.mongo.rounds_collection.findOne({ id: round_id });
-    if (!round_document) {
-      throw new app_error("round not found", 404);
-    }
-    if (round_document.status !== "predicting" || Date.now() >= Number(round_document.close_at_ms)) {
-      throw new app_error("round is locked", 409);
-    }
-
-    if (amount_lamports < 0) {
-      throw new app_error("amount must be positive", 400);
-    }
-    if (side !== "skip" && amount_lamports <= 0) {
-      throw new app_error("amount must be greater than zero for yes/no", 400);
-    }
-
-    const amount_to_store = side === "skip" ? 0 : amount_lamports;
+    await this.get_active_round_or_throw(round_id);
+    const amount_to_store = this.normalize_amount_or_throw(side, amount_lamports);
     const action_id = `${round_id}:${wallet}`;
     const existing_action = await this.mongo.round_actions_collection.findOne({ _id: action_id });
     const now = Date.now();
@@ -183,6 +204,35 @@ export class rounds_service {
     };
   }
 
+  private async get_active_round_or_throw(round_id: string): Promise<round_document> {
+    const round_document = await this.mongo.rounds_collection.findOne({ id: round_id });
+    if (!round_document) {
+      throw new app_error("round not found", 404);
+    }
+    if (round_document.status !== "predicting" || Date.now() >= Number(round_document.close_at_ms)) {
+      throw new app_error("round is locked", 409);
+    }
+    return round_document;
+  }
+
+  private async get_round_market_or_throw(round_document: round_document): Promise<market_document> {
+    const market_document = await this.mongo.markets_collection.findOne({ slug: round_document.market_slug });
+    if (!market_document) {
+      throw new app_error("market not found", 404);
+    }
+    return market_document;
+  }
+
+  private normalize_amount_or_throw(side: decision_side, amount_lamports: number): number {
+    if (amount_lamports < 0) {
+      throw new app_error("amount must be positive", 400);
+    }
+    if (side !== "skip" && amount_lamports <= 0) {
+      throw new app_error("amount must be greater than zero for yes/no", 400);
+    }
+    return side === "skip" ? 0 : amount_lamports;
+  }
+
   private async refresh_round_states(): Promise<void> {
     if (this.refresh_in_progress) {
       await this.refresh_in_progress;
@@ -201,7 +251,7 @@ export class rounds_service {
     if (this.refresh_in_progress) {
       return;
     }
-    if (now - this.last_refresh_started_at_ms < 3_000) {
+    if (now - this.last_refresh_started_at_ms < 1_000) {
       return;
     }
 
@@ -378,7 +428,7 @@ export class rounds_service {
     const now = Date.now();
     const expired_rounds = await this.mongo.rounds_collection
       .find({ status: "predicting", close_at_ms: { $lte: now } })
-      .sort({ close_at_ms: 1 })
+      .sort({ close_at_ms: -1 })
       .limit(transition_batch_size)
       .toArray();
 

@@ -11,11 +11,13 @@ import {
   create_commit_and_undelegate_round_instruction,
   create_lock_round_instruction,
   create_open_round_instruction,
+  create_place_prediction_instruction,
   create_program_delegate_pda_instruction,
   create_resolve_round_instruction,
   create_set_market_active_instruction,
   derive_market_pda,
-  derive_round_pda
+  derive_round_pda,
+  type decision_side
 } from "@/features/chain/ubalance-program";
 
 type market_chain_input = {
@@ -43,6 +45,13 @@ export type latest_round_snapshot = {
   open_at_ms: number;
   close_at_ms: number;
   winning_side: "yes" | "no" | "skip" | null;
+};
+
+export type prepared_prediction_transaction = {
+  transaction_base64: string;
+  blockhash: string;
+  last_valid_block_height: number;
+  fee_payer: string;
 };
 
 export const to_lamports_price = (value: number): number => {
@@ -326,6 +335,48 @@ export class chain_admin_service {
     });
 
     return this.send_base_transaction([resolve_ix], "resolve round");
+  }
+
+  async prepare_prediction_transaction(input: {
+    user_wallet: string;
+    market_pda: string;
+    round_pda: string;
+    side: decision_side;
+    amount_lamports: number;
+  }): Promise<prepared_prediction_transaction> {
+    const user = new PublicKey(input.user_wallet);
+    const market = new PublicKey(input.market_pda);
+    const round = new PublicKey(input.round_pda);
+
+    const place_prediction_ix = create_place_prediction_instruction({
+      program_id: this.program_id,
+      user,
+      market_pda: market,
+      round_pda: round,
+      side: input.side,
+      amount_lamports: input.amount_lamports
+    });
+
+    const latest = await this.er_connection.getLatestBlockhash("confirmed");
+    const transaction = new Transaction({
+      feePayer: this.admin.publicKey,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight
+    });
+    transaction.add(place_prediction_ix);
+    transaction.partialSign(this.admin);
+
+    return {
+      transaction_base64: transaction
+        .serialize({
+          requireAllSignatures: false,
+          verifySignatures: false
+        })
+        .toString("base64"),
+      blockhash: latest.blockhash,
+      last_valid_block_height: latest.lastValidBlockHeight,
+      fee_payer: this.admin.publicKey.toBase58()
+    };
   }
 
   private decode_round_account(data_buffer: Buffer | Uint8Array): {

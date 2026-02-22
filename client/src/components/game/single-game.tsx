@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import bs58 from "bs58";
-import { PublicKey, Transaction } from "@solana/web3.js";
+import { Transaction } from "@solana/web3.js";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { TopNav } from "@/components/layout/top-nav";
@@ -11,15 +11,27 @@ import { SwipeCard } from "@/components/game/swipe-card";
 import { auth_api } from "@/lib/auth.api";
 import { markets_api } from "@/lib/markets.api";
 import { rounds_api } from "@/lib/rounds.api";
-import { env } from "@/lib/env";
-import { format_price } from "@/lib/format";
-import { to_market_options } from "@/lib/markets";
-import {
-  create_place_prediction_instruction,
-  resolve_program_id
-} from "@/lib/ubalance-program";
 import type { market } from "@/types/market";
 import type { decision_side, round_view } from "@/types/round";
+
+const decode_base64 = (value: string): Uint8Array => {
+  const raw = atob(value);
+  const bytes = new Uint8Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) {
+    bytes[index] = raw.charCodeAt(index);
+  }
+  return bytes;
+};
+
+const is_retryable_relay_error = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("blockhash not found") ||
+    normalized.includes("transactionexpiredblockheightexceeded") ||
+    normalized.includes("block height exceeded")
+  );
+};
 
 export const SingleGame = () => {
   const wallet = useWallet();
@@ -29,6 +41,8 @@ export const SingleGame = () => {
   const [markets, set_markets] = useState<market[]>([]);
   const [rounds, set_rounds] = useState<round_view[]>([]);
   const [history_rounds, set_history_rounds] = useState<round_view[]>([]);
+
+  const [skipped_round_ids, set_skipped_round_ids] = useState<Set<string>>(new Set());
 
   const [selected_timeframe, set_selected_timeframe] = useState<number | null>(null);
   const [search_query, set_search_query] = useState("");
@@ -51,8 +65,8 @@ export const SingleGame = () => {
       filtered_markets = markets.filter((m: market) => m.timeframe_minutes === selected_timeframe);
     }
     const valid_slugs = new Set(filtered_markets.map((m: market) => m.slug));
-    return rounds.filter((r: round_view) => valid_slugs.has(r.market.slug));
-  }, [rounds, markets, selected_timeframe]);
+    return rounds.filter((r: round_view) => valid_slugs.has(r.market.slug) && !skipped_round_ids.has(r.id));
+  }, [rounds, markets, selected_timeframe, skipped_round_ids]);
 
   const active_round = active_queue.length > 0 ? active_queue[0] : null;
 
@@ -146,48 +160,72 @@ export const SingleGame = () => {
         return;
       }
 
+      if (side === "skip") {
+        set_skipped_round_ids(prev => new Set(prev).add(active_round.id));
+        set_status("skipped round");
+        return;
+      }
+
       set_submitting(true);
       try {
         const token = await ensure_wallet_and_auth();
-        if (!token || !wallet.publicKey || !wallet.sendTransaction) {
+        if (!token || !wallet.publicKey || !wallet.signTransaction) {
           return;
         }
 
-        const base_amount_lamports = Math.max(0, Math.round(amount_sol * 1_000_000_000));
-        const amount_lamports = side === "skip" ? 0 : base_amount_lamports;
+        const amount_lamports = Math.max(0, Math.round(amount_sol * 1_000_000_000));
 
-        if (side !== "skip" && amount_lamports <= 0) {
+        if (amount_lamports <= 0) {
           set_status("amount must be greater than zero for yes/no");
           return;
         }
 
-        const program_id = resolve_program_id(env.ubalanceProgramId);
-        const market_pda = new PublicKey(active_round.marketPda);
-        const round_pda = new PublicKey(active_round.roundPda);
+        let tx_signature: string | null = null;
+        let last_error: unknown = null;
+        const relay_max_attempts = 2;
 
-        const place_prediction_ix = create_place_prediction_instruction({
-          program_id,
-          user: wallet.publicKey,
-          market_pda,
-          round_pda,
-          side,
-          amount_lamports
-        });
+        for (let attempt = 1; attempt <= relay_max_attempts; attempt += 1) {
+          try {
+            const prepared = await rounds_api.prepare_relay_action(
+              active_round.id,
+              side,
+              amount_lamports,
+              token
+            );
 
-        const transaction = new Transaction().add(place_prediction_ix);
-        const tx_signature = await wallet.sendTransaction(transaction, connection, {
-          preflightCommitment: "confirmed"
-        });
+            const unsigned_tx = Transaction.from(decode_base64(prepared.data.transactionBase64));
+            const signed_tx = await wallet.signTransaction(unsigned_tx);
+            tx_signature = await connection.sendRawTransaction(signed_tx.serialize(), {
+              preflightCommitment: "confirmed",
+              maxRetries: 3
+            });
 
-        const latest = await connection.getLatestBlockhash("confirmed");
-        await connection.confirmTransaction(
-          {
-            signature: tx_signature,
-            blockhash: latest.blockhash,
-            lastValidBlockHeight: latest.lastValidBlockHeight
-          },
-          "confirmed"
-        );
+            const confirmation = await connection.confirmTransaction(
+              {
+                signature: tx_signature,
+                blockhash: prepared.data.blockhash,
+                lastValidBlockHeight: prepared.data.lastValidBlockHeight
+              },
+              "confirmed"
+            );
+
+            if (confirmation.value.err) {
+              throw new Error(JSON.stringify(confirmation.value.err));
+            }
+
+            break;
+          } catch (error: unknown) {
+            last_error = error;
+            if (attempt < relay_max_attempts && is_retryable_relay_error(error)) {
+              continue;
+            }
+            throw error;
+          }
+        }
+
+        if (!tx_signature) {
+          throw (last_error instanceof Error ? last_error : new Error("failed to relay prediction transaction"));
+        }
 
         await rounds_api.submit_action(active_round.id, side, amount_lamports, token, tx_signature);
         set_status(`submitted ${side} (${tx_signature.slice(0, 8)}...)`);
@@ -201,35 +239,7 @@ export const SingleGame = () => {
     [active_round, amount_sol, connection, ensure_wallet_and_auth, load_data, wallet]
   );
 
-  useEffect(() => {
-    const on_key_down = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) {
-        return;
-      }
-      if (target?.isContentEditable) {
-        return;
-      }
 
-      if (!active_round || submitting) {
-        return;
-      }
-
-      if (event.key === "ArrowLeft") {
-        event.preventDefault();
-        void submit_decision("no");
-      } else if (event.key === "ArrowRight") {
-        event.preventDefault();
-        void submit_decision("yes");
-      } else if (event.key === "ArrowDown") {
-        event.preventDefault();
-        void submit_decision("skip");
-      }
-    };
-
-    window.addEventListener("keydown", on_key_down);
-    return () => window.removeEventListener("keydown", on_key_down);
-  }, [active_round, submitting, submit_decision]);
 
   return (
     <div className="min-h-screen bg-[#0b0f0e] text-[#e7efe9] pb-10 selection:bg-[#b9f6c9] selection:text-[#0a1611]">

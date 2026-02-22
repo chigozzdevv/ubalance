@@ -176,7 +176,7 @@ export const create_place_prediction_instruction = (args: {
   return new TransactionInstruction({
     programId: args.program_id,
     keys: [
-      { pubkey: args.user, isWritable: true, isSigner: true },
+      { pubkey: args.user, isWritable: false, isSigner: true },
       { pubkey: args.market_pda, isWritable: false, isSigner: false },
       { pubkey: args.round_pda, isWritable: true, isSigner: false }
     ],

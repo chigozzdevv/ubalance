@@ -55,30 +55,35 @@ export const TopNav = ({
         </div>
 
         <div className="flex w-full flex-col gap-3 md:max-w-xl md:flex-row items-center justify-end">
-          <select
-            value={selected_timeframe === null ? "" : selected_timeframe.toString()}
-            onChange={(event) => {
-              const val = event.target.value;
-              on_select_timeframe(val === "" ? null : Number(val));
-            }}
-            disabled={timeframes.length === 0}
-            className="h-11 min-w-40 md:min-w-52 rounded-xl border border-[#1e2422] bg-[#111513] px-4 text-sm font-semibold text-[#e7efe9] outline-none transition duration-200 focus:border-[#89eeb0] focus:ring-1 focus:ring-[#89eeb0] flex-1 md:flex-none appearance-none cursor-pointer"
-            style={{
-              backgroundImage: 'url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'%239eaba4\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'%3e%3cpolyline points=\'6 9 12 15 18 9\'%3e%3c/polyline%3e%3c/svg%3e")',
-              backgroundRepeat: "no-repeat",
-              backgroundPosition: "right 12px center",
-              backgroundSize: "16px",
-              paddingRight: "40px"
-            }}
-          >
-            {timeframes.length === 0 ? <option value="">no markets</option> : null}
-            <option value="">all markets</option>
-            {timeframes.map((tf) => (
-              <option key={tf} value={tf.toString()}>
-                {tf}m markets
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center gap-2 flex-1 md:flex-none">
+            <span className="text-sm font-bold text-[#e7efe9] whitespace-nowrap">
+              Markets:
+            </span>
+            <div className="relative flex items-center bg-[#111513] border border-[#1e2422] rounded-xl pl-4 pr-3 h-11 transition duration-200 focus-within:border-[#89eeb0] focus-within:ring-1 focus-within:ring-[#89eeb0] w-full md:w-auto">
+              <select
+                value={selected_timeframe === null ? "" : selected_timeframe.toString()}
+                onChange={(event) => {
+                  const val = event.target.value;
+                  on_select_timeframe(val === "" ? null : Number(val));
+                }}
+                disabled={timeframes.length === 0}
+                className="bg-transparent text-sm font-semibold text-[#e7efe9] outline-none focus:outline-none appearance-none cursor-pointer pr-5 w-auto"
+              >
+                {timeframes.length === 0 ? <option value="">none</option> : null}
+                <option value="">all</option>
+                {timeframes.map((tf) => (
+                  <option key={tf} value={tf.toString()}>
+                    {tf}m
+                  </option>
+                ))}
+              </select>
+              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-[#9eaba4]">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
+            </div>
+          </div>
 
           <div className="relative" ref={amount_ref}>
             <button

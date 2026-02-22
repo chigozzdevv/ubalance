@@ -280,7 +280,6 @@ pub struct OpenRound<'info> {
 
 #[derive(Accounts)]
 pub struct PlacePrediction<'info> {
-    #[account(mut)]
     pub user: Signer<'info>,
     pub market: Account<'info, Market>,
     #[account(

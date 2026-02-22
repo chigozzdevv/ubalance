@@ -334,7 +334,7 @@ const place_prediction_on_er = async (wallet_keypair, round, side, amount_lampor
   const place_prediction_ix = new TransactionInstruction({
     programId: program_id,
     keys: [
-      { pubkey: wallet_keypair.publicKey, isWritable: true, isSigner: true },
+      { pubkey: wallet_keypair.publicKey, isWritable: false, isSigner: true },
       { pubkey: market_pda, isWritable: false, isSigner: false },
       { pubkey: round_pda, isWritable: true, isSigner: false }
     ],

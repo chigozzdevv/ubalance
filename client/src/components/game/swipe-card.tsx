@@ -1,6 +1,7 @@
 "use client";
 
-import { motion } from "framer-motion";
+import { useEffect } from "react";
+import { motion, useMotionValue, useTransform, useAnimation } from "framer-motion";
 import type { decision_side, round_view } from "@/types/round";
 import { format_price, format_sol } from "@/lib/format";
 
@@ -12,29 +13,73 @@ type swipe_card_props = {
 };
 
 export const SwipeCard = ({ round, amount_sol, on_decision, disabled }: swipe_card_props) => {
+  const x_mv = useMotionValue(0);
+  const rotate = useTransform(x_mv, [-200, 200], [-15, 15]);
+  const controls = useAnimation();
+
+  const handle_drag_end = async (_: any, info: any) => {
+    if (disabled) return;
+
+    const threshold = 140;
+    const velocity_threshold = 500;
+    const x = info.offset.x;
+    const v_x = info.velocity.x;
+    const y = info.offset.y;
+
+    if (x > threshold || v_x > velocity_threshold) {
+      await controls.start({ x: 500, opacity: 0, transition: { duration: 0.3 } });
+      on_decision("yes");
+    } else if (x < -threshold || v_x < -velocity_threshold) {
+      await controls.start({ x: -500, opacity: 0, transition: { duration: 0.3 } });
+      on_decision("no");
+    } else if (y > 120) {
+      await controls.start({ y: 500, opacity: 0, transition: { duration: 0.3 } });
+      on_decision("skip");
+    } else {
+      controls.start({ x: 0, y: 0, transition: { type: "spring", stiffness: 300, damping: 20 } });
+    }
+  };
+
+  useEffect(() => {
+    const on_key_down = async (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) {
+        return;
+      }
+      if (target?.isContentEditable) {
+        return;
+      }
+      if (disabled) return;
+
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        await controls.start({ x: -500, opacity: 0, transition: { duration: 0.3 } });
+        on_decision("no");
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        await controls.start({ x: 500, opacity: 0, transition: { duration: 0.3 } });
+        on_decision("yes");
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        await controls.start({ y: 500, opacity: 0, transition: { duration: 0.3 } });
+        on_decision("skip");
+      }
+    };
+
+    window.addEventListener("keydown", on_key_down);
+    return () => window.removeEventListener("keydown", on_key_down);
+  }, [disabled, controls, on_decision]);
+
   return (
     <motion.div
       drag={!disabled}
-      dragElastic={0.2}
-      onDragEnd={(_, info) => {
-        if (disabled) {
-          return;
-        }
-
-        if (info.offset.x > 140) {
-          on_decision("yes");
-          return;
-        }
-        if (info.offset.x < -140) {
-          on_decision("no");
-          return;
-        }
-        if (info.offset.y > 120) {
-          on_decision("skip");
-        }
-      }}
-      whileDrag={disabled ? undefined : { scale: 1.02 }}
-      className="relative flex flex-col justify-between overflow-hidden rounded-[2rem] border border-[#1e2422] bg-[#111513] p-6 shadow-2xl h-[420px] w-full max-w-[360px] mx-auto cursor-grab active:cursor-grabbing"
+      dragDirectionLock={false}
+      dragElastic={0.4}
+      style={{ x: x_mv, rotate }}
+      animate={controls}
+      onDragEnd={handle_drag_end}
+      whileDrag={disabled ? undefined : { scale: 1.05, cursor: "grabbing" }}
+      className="relative flex flex-col justify-between overflow-hidden rounded-[2rem] border border-[#1e2422] bg-[#111513] p-6 shadow-2xl h-[420px] w-full max-w-[360px] mx-auto cursor-grab"
     >
       <div className="absolute inset-0 pointer-events-none bg-gradient-to-t from-[#0b0f0e] via-transparent to-transparent opacity-80 z-0"></div>
 

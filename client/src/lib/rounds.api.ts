@@ -10,6 +10,28 @@ export const rounds_api = {
     return api.get<{ success: true; data: round_view[] }>(`/rounds/history?limit=${limit}`);
   },
 
+  prepare_relay_action(
+    round_id: string,
+    side: decision_side,
+    amount_lamports: number,
+    session_token: string
+  ) {
+    return api.post<{
+      success: true;
+      data: {
+        transactionBase64: string;
+        blockhash: string;
+        lastValidBlockHeight: number;
+        feePayer: string;
+        amountLamports: number;
+      };
+    }>(
+      `/rounds/${round_id}/actions/relay-prepare`,
+      { side, amountLamports: amount_lamports },
+      session_token
+    );
+  },
+
   submit_action(
     round_id: string,
     side: decision_side,
