@@ -1,8 +1,8 @@
 # ubalance prediction market
 
-## About
+![Ubalance landing](client/public/ubalance-landing.png)
 
-`ubalance` is a swipe-based prediction market on Solana that uses MagicBlock Ephemeral Rollups (ER) for fast prediction writes and periodically settles round state back to base Solana.
+`Ubalance` is a swipe-based prediction market on Solana that uses MagicBlock Ephemeral Rollups (ER) for fast prediction writes and periodically settles round state back to base Solana.
 
 Main characteristics:
 
