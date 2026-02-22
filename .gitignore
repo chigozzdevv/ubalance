@@ -1,0 +1,11 @@
+node_modules
+.DS_Store
+.env
+.env.local
+server/dist
+client/dist
+client/.next
+server/.keys
+contracts/anchor/target
+contracts/anchor/.anchor
+/package-lock.json

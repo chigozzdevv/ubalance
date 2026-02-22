@@ -1,0 +1,11 @@
+{
+  "name": "ubalance-prediction-market-root",
+  "private": true,
+  "scripts": {
+    "install:all": "cd server && npm install && cd ../client && npm install",
+    "dev": "(cd server && npm run dev) & (cd client && npm run dev)",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "build": "cd server && npm run build && cd ../client && npm run build"
+  }
+}
