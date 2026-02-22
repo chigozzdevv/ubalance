@@ -229,6 +229,7 @@ export const SingleGame = () => {
 
         await rounds_api.submit_action(active_round.id, side, amount_lamports, token, tx_signature);
         set_status(`submitted ${side} (${tx_signature.slice(0, 8)}...)`);
+        set_skipped_round_ids(prev => new Set(prev).add(active_round.id));
         await load_data();
       } catch (error: any) {
         set_status(error.message || "submit failed");
