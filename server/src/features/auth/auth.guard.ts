@@ -10,7 +10,7 @@ export const build_auth_guard = (service: auth_service) => {
     }
     const token = header.slice("Bearer ".length).trim();
     try {
-      const session = service.get_session(token);
+      const session = await service.get_session(token);
       request.auth_wallet = session.wallet;
     } catch (error: any) {
       reply.code(401).send({ success: false, message: error.message || "unauthorized" });

@@ -55,12 +55,32 @@ export type round_action_document = {
   updated_at_ms: number;
 };
 
+export type auth_challenge_document = {
+  _id: string;
+  wallet: string;
+  message: string;
+  expires_at_ms: number;
+  expires_at: Date;
+  updated_at_ms: number;
+};
+
+export type auth_session_document = {
+  _id: string;
+  token: string;
+  wallet: string;
+  expires_at_ms: number;
+  expires_at: Date;
+  created_at_ms: number;
+};
+
 export class mongo_service {
   readonly client: MongoClient;
   db!: Db;
   markets_collection!: Collection<market_document>;
   rounds_collection!: Collection<round_document>;
   round_actions_collection!: Collection<round_action_document>;
+  auth_challenges_collection!: Collection<auth_challenge_document>;
+  auth_sessions_collection!: Collection<auth_session_document>;
   private readonly init_promise: Promise<void>;
 
   constructor() {
@@ -78,6 +98,8 @@ export class mongo_service {
     this.markets_collection = this.db.collection<market_document>("markets");
     this.rounds_collection = this.db.collection<round_document>("rounds");
     this.round_actions_collection = this.db.collection<round_action_document>("round_actions");
+    this.auth_challenges_collection = this.db.collection<auth_challenge_document>("auth_challenges");
+    this.auth_sessions_collection = this.db.collection<auth_session_document>("auth_sessions");
     await this.ensure_indexes();
   }
 
@@ -96,5 +118,16 @@ export class mongo_service {
 
     await this.round_actions_collection.createIndex({ round_id: 1, wallet: 1 }, { unique: true, name: "idx_actions_round_wallet_unique" });
     await this.round_actions_collection.createIndex({ round_id: 1 }, { name: "idx_actions_round" });
+
+    await this.auth_challenges_collection.createIndex(
+      { expires_at: 1 },
+      { expireAfterSeconds: 0, name: "idx_auth_challenges_expires_ttl" }
+    );
+
+    await this.auth_sessions_collection.createIndex({ wallet: 1 }, { name: "idx_auth_sessions_wallet" });
+    await this.auth_sessions_collection.createIndex(
+      { expires_at: 1 },
+      { expireAfterSeconds: 0, name: "idx_auth_sessions_expires_ttl" }
+    );
   }
 }

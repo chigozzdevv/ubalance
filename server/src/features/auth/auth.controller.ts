@@ -19,7 +19,7 @@ export class auth_controller {
   request_challenge = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const payload = challenge_schema.parse(request.body ?? {});
-      const challenge = this.service.request_challenge(payload.wallet);
+      const challenge = await this.service.request_challenge(payload.wallet);
       reply.send(ok({
         wallet: challenge.wallet,
         message: challenge.message,
@@ -33,7 +33,7 @@ export class auth_controller {
   verify_challenge = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const payload = verify_schema.parse(request.body ?? {});
-      const session = this.service.verify_challenge(payload.wallet, payload.signature);
+      const session = await this.service.verify_challenge(payload.wallet, payload.signature);
       reply.send(ok({
         wallet: session.wallet,
         token: session.token,

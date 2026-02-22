@@ -17,8 +17,8 @@ import { register_er_routes } from "@/features/er/er.routes";
 import { mongo_service } from "@/shared/mongo";
 
 export const register_routes = async (fastify: FastifyInstance) => {
-  const auth_service_instance = new auth_service();
   const mongo_service_instance = new mongo_service();
+  const auth_service_instance = new auth_service(mongo_service_instance);
   const chain_admin_service_instance = new chain_admin_service();
   const oracle_service_instance = new oracle_service();
   const markets_service_instance = new markets_service(mongo_service_instance, chain_admin_service_instance);

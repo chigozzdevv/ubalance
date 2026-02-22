@@ -5,13 +5,15 @@ import { PublicKey } from "@solana/web3.js";
 import { env } from "@/config/env";
 import { app_error } from "@/shared/app-error";
 import type { challenge_record, session_record } from "@/features/auth/auth.model";
+import type { mongo_service } from "@/shared/mongo";
 
 export class auth_service {
-  private challenges = new Map<string, challenge_record>();
-  private sessions = new Map<string, session_record>();
+  constructor(private readonly mongo: mongo_service) {}
 
-  request_challenge(wallet: string): challenge_record {
+  async request_challenge(wallet: string): Promise<challenge_record> {
     this.assert_wallet(wallet);
+    await this.mongo.ensure_ready();
+
     const nonce = randomUUID();
     const issued_at = new Date().toISOString();
     const message = [
@@ -25,23 +27,43 @@ export class auth_service {
       message,
       expires_at_ms: Date.now() + env.AUTH_CHALLENGE_TTL_SECONDS * 1000
     };
-    this.challenges.set(wallet, challenge);
+
+    await this.mongo.auth_challenges_collection.updateOne(
+      { _id: wallet },
+      {
+        $set: {
+          wallet: challenge.wallet,
+          message: challenge.message,
+          expires_at_ms: challenge.expires_at_ms,
+          expires_at: new Date(challenge.expires_at_ms),
+          updated_at_ms: Date.now()
+        },
+        $setOnInsert: {
+          _id: wallet
+        }
+      },
+      { upsert: true }
+    );
+
     return challenge;
   }
 
-  verify_challenge(wallet: string, signature: string): session_record {
+  async verify_challenge(wallet: string, signature: string): Promise<session_record> {
     this.assert_wallet(wallet);
-    const challenge = this.challenges.get(wallet);
-    if (!challenge) {
+    await this.mongo.ensure_ready();
+
+    const challenge_document = await this.mongo.auth_challenges_collection.findOne({ _id: wallet });
+    if (!challenge_document) {
       throw new app_error("challenge not found", 404);
     }
-    if (challenge.expires_at_ms < Date.now()) {
-      this.challenges.delete(wallet);
+
+    if (challenge_document.expires_at_ms < Date.now()) {
+      await this.mongo.auth_challenges_collection.deleteOne({ _id: wallet });
       throw new app_error("challenge expired", 401);
     }
 
     const signature_bytes = this.decode_signature(signature);
-    const message_bytes = new TextEncoder().encode(challenge.message);
+    const message_bytes = new TextEncoder().encode(challenge_document.message);
     const wallet_bytes = new PublicKey(wallet).toBytes();
 
     const valid = nacl.sign.detached.verify(message_bytes, signature_bytes, wallet_bytes);
@@ -49,26 +71,44 @@ export class auth_service {
       throw new app_error("invalid signature", 401);
     }
 
-    this.challenges.delete(wallet);
+    await this.mongo.auth_challenges_collection.deleteOne({ _id: wallet });
+
     const session: session_record = {
       wallet,
       token: randomUUID(),
       expires_at_ms: Date.now() + env.AUTH_SESSION_TTL_SECONDS * 1000
     };
-    this.sessions.set(session.token, session);
+
+    await this.mongo.auth_sessions_collection.insertOne({
+      _id: session.token,
+      token: session.token,
+      wallet: session.wallet,
+      expires_at_ms: session.expires_at_ms,
+      expires_at: new Date(session.expires_at_ms),
+      created_at_ms: Date.now()
+    });
+
     return session;
   }
 
-  get_session(token: string): session_record {
-    const session = this.sessions.get(token);
-    if (!session) {
+  async get_session(token: string): Promise<session_record> {
+    await this.mongo.ensure_ready();
+
+    const session_document = await this.mongo.auth_sessions_collection.findOne({ _id: token });
+    if (!session_document) {
       throw new app_error("invalid session", 401);
     }
-    if (session.expires_at_ms < Date.now()) {
-      this.sessions.delete(token);
+
+    if (session_document.expires_at_ms < Date.now()) {
+      await this.mongo.auth_sessions_collection.deleteOne({ _id: token });
       throw new app_error("session expired", 401);
     }
-    return session;
+
+    return {
+      wallet: session_document.wallet,
+      token: session_document.token,
+      expires_at_ms: session_document.expires_at_ms
+    };
   }
 
   private decode_signature(signature: string): Uint8Array {
