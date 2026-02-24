@@ -1,5 +1,4 @@
 import "dotenv/config";
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,8 +12,6 @@ import {
   LAMPORTS_PER_SOL,
   PublicKey,
   Transaction,
-  TransactionInstruction,
-  sendAndConfirmTransaction
 } from "@solana/web3.js";
 
 const script_dir = dirname(fileURLToPath(import.meta.url));
@@ -106,7 +103,6 @@ const health_url = `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}/he
 const er_rpc_url = env_or("ER_RPC_URL", "https://devnet-us.magicblock.app");
 const er_ws_url = env_or("ER_WS_URL", "wss://devnet-us.magicblock.app");
 const base_rpc_url = env_or("SOLANA_RPC_URL", "https://api.devnet.solana.com");
-const program_id = new PublicKey(env_or("UBALANCE_PROGRAM_ID", "FkZVTshsawSNHYzxFZFfdBJUbLxvQJVhWtJqi8FgunFG"));
 
 const log = (message) => {
   const timestamp = new Date().toISOString();
@@ -115,6 +111,16 @@ const log = (message) => {
 
 const sleep = async (ms) => {
   await new Promise((resolve_sleep) => setTimeout(resolve_sleep, ms));
+};
+
+const is_retryable_relay_error = (error) => {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("blockhash not found") ||
+    normalized.includes("transactionexpiredblockheightexceeded") ||
+    normalized.includes("block height exceeded")
+  );
 };
 
 const normalized_keypair_path = isAbsolute(options.keypair_path)
@@ -147,20 +153,6 @@ const load_admin_public_key = () => {
     : bs58.decode(trimmed);
 
   return Keypair.fromSecretKey(secret).publicKey;
-};
-
-const load_admin_keypair = () => {
-  const raw = env_or("UBALANCE_ADMIN_SECRET_KEY", "");
-  if (!raw) {
-    throw new Error("UBALANCE_ADMIN_SECRET_KEY is required for ER fee payer");
-  }
-
-  const trimmed = raw.trim();
-  const secret = trimmed.startsWith("[")
-    ? Uint8Array.from(JSON.parse(trimmed))
-    : bs58.decode(trimmed);
-
-  return Keypair.fromSecretKey(secret);
 };
 
 const parse_json = async (response) => {
@@ -295,63 +287,122 @@ const authenticate = async (wallet_keypair) => {
   return token;
 };
 
-const instruction_discriminator = (name) => {
-  return createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
-};
-
-const encode_side = (side) => {
-  if (side === "yes") {
-    return Buffer.from([0]);
-  }
-  if (side === "no") {
-    return Buffer.from([1]);
-  }
-  return Buffer.from([2]);
-};
-
-const encode_u64 = (value) => {
-  const buffer = Buffer.alloc(8);
-  buffer.writeBigUInt64LE(BigInt(value), 0);
-  return buffer;
-};
-
-const place_prediction_on_er = async (wallet_keypair, round, side, amount_lamports) => {
+const place_prediction_via_relay = async (wallet_keypair, round_id, side, amount_lamports, session_token) => {
   const connection = new Connection(er_rpc_url, {
     commitment: "confirmed",
     wsEndpoint: er_ws_url
   });
-  const admin_keypair = load_admin_keypair();
+  const max_attempts = 2;
+  let last_error = null;
 
-  const market_pda = new PublicKey(round.marketPda);
-  const round_pda = new PublicKey(round.roundPda);
+  for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
+    try {
+      const prepared = await api_post(
+        `/rounds/${round_id}/actions/relay-prepare`,
+        {
+          side,
+          amountLamports: amount_lamports
+        },
+        session_token
+      );
+      const transaction_base64 = prepared?.data?.transactionBase64;
+      const blockhash = prepared?.data?.blockhash;
+      const last_valid_block_height = prepared?.data?.lastValidBlockHeight;
+      if (
+        typeof transaction_base64 !== "string" ||
+        typeof blockhash !== "string" ||
+        !Number.isFinite(last_valid_block_height)
+      ) {
+        throw new Error("invalid relay-prepare response");
+      }
 
-  const data = Buffer.concat([
-    instruction_discriminator("place_prediction"),
-    encode_side(side),
-    encode_u64(amount_lamports)
-  ]);
+      const transaction = Transaction.from(Buffer.from(transaction_base64, "base64"));
+      transaction.partialSign(wallet_keypair);
 
-  const place_prediction_ix = new TransactionInstruction({
-    programId: program_id,
-    keys: [
-      { pubkey: wallet_keypair.publicKey, isWritable: false, isSigner: true },
-      { pubkey: market_pda, isWritable: false, isSigner: false },
-      { pubkey: round_pda, isWritable: true, isSigner: false }
-    ],
-    data
-  });
+      const tx_signature = await connection.sendRawTransaction(transaction.serialize(), {
+        preflightCommitment: "confirmed",
+        maxRetries: 3
+      });
 
-  const transaction = new Transaction({ feePayer: admin_keypair.publicKey }).add(place_prediction_ix);
-  const signers = admin_keypair.publicKey.equals(wallet_keypair.publicKey)
-    ? [admin_keypair]
-    : [admin_keypair, wallet_keypair];
+      const confirmation = await connection.confirmTransaction(
+        {
+          signature: tx_signature,
+          blockhash,
+          lastValidBlockHeight: last_valid_block_height
+        },
+        "confirmed"
+      );
+      if (confirmation.value.err) {
+        throw new Error(JSON.stringify(confirmation.value.err));
+      }
 
-  const tx_signature = await sendAndConfirmTransaction(connection, transaction, signers, {
-    skipPreflight: true,
-    commitment: "confirmed"
-  });
+      return tx_signature;
+    } catch (error) {
+      last_error = error;
+      if (attempt < max_attempts && is_retryable_relay_error(error)) {
+        continue;
+      }
+      throw error;
+    }
+  }
 
-  return tx_signature;
+  throw (last_error instanceof Error ? last_error : new Error("relay prediction failed"));
+};
+
+const claim_payout_via_relay = async (wallet_keypair, round_id, session_token) => {
+  const connection = new Connection(base_rpc_url, "confirmed");
+  const max_attempts = 2;
+  let last_error = null;
+
+  for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
+    try {
+      const prepared = await api_post(
+        `/rounds/${round_id}/claims/relay-prepare`,
+        {},
+        session_token
+      );
+      const transaction_base64 = prepared?.data?.transactionBase64;
+      const blockhash = prepared?.data?.blockhash;
+      const last_valid_block_height = prepared?.data?.lastValidBlockHeight;
+      if (
+        typeof transaction_base64 !== "string" ||
+        typeof blockhash !== "string" ||
+        !Number.isFinite(last_valid_block_height)
+      ) {
+        throw new Error("invalid claim relay-prepare response");
+      }
+
+      const transaction = Transaction.from(Buffer.from(transaction_base64, "base64"));
+      transaction.partialSign(wallet_keypair);
+
+      const tx_signature = await connection.sendRawTransaction(transaction.serialize(), {
+        preflightCommitment: "confirmed",
+        maxRetries: 3
+      });
+
+      const confirmation = await connection.confirmTransaction(
+        {
+          signature: tx_signature,
+          blockhash,
+          lastValidBlockHeight: last_valid_block_height
+        },
+        "confirmed"
+      );
+      if (confirmation.value.err) {
+        throw new Error(JSON.stringify(confirmation.value.err));
+      }
+
+      return tx_signature;
+    } catch (error) {
+      last_error = error;
+      if (attempt < max_attempts && is_retryable_relay_error(error)) {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw (last_error instanceof Error ? last_error : new Error("relay claim failed"));
 };
 
 const wait_for_round_status = async (round_id, expected_status, timeout_ms) => {
@@ -427,7 +478,13 @@ const run_iteration = async (iteration_index, session_token, wallet_keypair) => 
   log(`iteration ${iteration_index}: selected ${round_id} (${round.market.slug}), closes in ${Math.max(0, Math.round((Number(round.closeAtMs) - Date.now()) / 1000))}s`);
   await wait_for_round_delegated(round.roundPda, options.timeout_ms);
 
-  const tx_signature = await place_prediction_on_er(wallet_keypair, round, options.side, amount_lamports);
+  const tx_signature = await place_prediction_via_relay(
+    wallet_keypair,
+    round_id,
+    options.side,
+    amount_lamports,
+    session_token
+  );
   log(`iteration ${iteration_index}: on-chain prediction tx ${tx_signature}`);
 
   await api_post(
@@ -455,6 +512,13 @@ const run_iteration = async (iteration_index, session_token, wallet_keypair) => 
   log(
     `iteration ${iteration_index}: round resolved (${resolved_round.resolveTxSignature}), winner=${resolved_round.winningSide ?? "unknown"}, reference=${resolved_round.referencePrice}, settlement=${resolved_round.settlementPrice}`
   );
+
+  if (options.side !== "skip" && resolved_round.winningSide === options.side) {
+    const claim_signature = await claim_payout_via_relay(wallet_keypair, round_id, session_token);
+    log(`iteration ${iteration_index}: claim submitted (${claim_signature})`);
+  } else {
+    log(`iteration ${iteration_index}: claim skipped (side=${options.side}, winner=${resolved_round.winningSide ?? "unknown"})`);
+  }
 };
 
 const main = async () => {

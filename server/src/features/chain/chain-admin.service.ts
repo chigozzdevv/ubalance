@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import bs58 from "bs58";
 import {
   DELEGATION_PROGRAM_ID,
@@ -7,6 +8,7 @@ import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction } f
 import { env } from "@/config/env";
 import { app_error } from "@/shared/app-error";
 import {
+  create_claim_payout_instruction,
   create_initialize_market_instruction,
   create_commit_and_undelegate_round_instruction,
   create_lock_round_instruction,
@@ -16,6 +18,7 @@ import {
   create_resolve_round_instruction,
   create_set_market_active_instruction,
   derive_market_pda,
+  derive_position_pda,
   derive_round_pda,
   type decision_side
 } from "@/features/chain/ubalance-program";
@@ -77,6 +80,11 @@ const load_admin_secret_key = (): Uint8Array => {
 const sleep = async (ms: number): Promise<void> => {
   await new Promise((resolve_sleep) => setTimeout(resolve_sleep, ms));
 };
+
+const place_prediction_discriminator = createHash("sha256")
+  .update("global:place_prediction")
+  .digest()
+  .subarray(0, 8);
 
 export class chain_admin_service {
   readonly base_connection: Connection;
@@ -347,12 +355,14 @@ export class chain_admin_service {
     const user = new PublicKey(input.user_wallet);
     const market = new PublicKey(input.market_pda);
     const round = new PublicKey(input.round_pda);
+    const position = derive_position_pda(this.program_id, round, user);
 
     const place_prediction_ix = create_place_prediction_instruction({
       program_id: this.program_id,
       user,
       market_pda: market,
       round_pda: round,
+      position_pda: position,
       side: input.side,
       amount_lamports: input.amount_lamports
     });
@@ -377,6 +387,187 @@ export class chain_admin_service {
       last_valid_block_height: latest.lastValidBlockHeight,
       fee_payer: this.admin.publicKey.toBase58()
     };
+  }
+
+  async prepare_claim_payout_transaction(input: {
+    user_wallet: string;
+    market_pda: string;
+    round_pda: string;
+  }): Promise<prepared_prediction_transaction> {
+    const user = new PublicKey(input.user_wallet);
+    const market = new PublicKey(input.market_pda);
+    const round = new PublicKey(input.round_pda);
+    const position = derive_position_pda(this.program_id, round, user);
+
+    const claim_payout_ix = create_claim_payout_instruction({
+      program_id: this.program_id,
+      user,
+      market_pda: market,
+      round_pda: round,
+      position_pda: position
+    });
+
+    const latest = await this.base_connection.getLatestBlockhash("confirmed");
+    const transaction = new Transaction({
+      feePayer: this.admin.publicKey,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight
+    });
+    transaction.add(claim_payout_ix);
+    transaction.partialSign(this.admin);
+
+    return {
+      transaction_base64: transaction
+        .serialize({
+          requireAllSignatures: false,
+          verifySignatures: false
+        })
+        .toString("base64"),
+      blockhash: latest.blockhash,
+      last_valid_block_height: latest.lastValidBlockHeight,
+      fee_payer: this.admin.publicKey.toBase58()
+    };
+  }
+
+  async verify_prediction_transaction(input: {
+    tx_signature: string;
+    expected_wallet: string;
+    expected_market_pda: string;
+    expected_round_pda: string;
+    expected_side: decision_side;
+    expected_amount_lamports: number;
+  }): Promise<void> {
+    const parsed = await this.get_parsed_transaction_with_retry(input.tx_signature);
+
+    if (!parsed) {
+      throw new app_error("prediction transaction not found", 400);
+    }
+    if (parsed.meta?.err) {
+      throw new app_error("prediction transaction failed", 400);
+    }
+
+    const expected_wallet = new PublicKey(input.expected_wallet).toBase58();
+    const expected_market = new PublicKey(input.expected_market_pda).toBase58();
+    const expected_round = new PublicKey(input.expected_round_pda).toBase58();
+    const expected_position = derive_position_pda(
+      this.program_id,
+      new PublicKey(expected_round),
+      new PublicKey(expected_wallet)
+    ).toBase58();
+    const expected_program = this.program_id.toBase58();
+    const expected_system_program = "11111111111111111111111111111111";
+    const signer_present = parsed.transaction.message.accountKeys.some((key: any) => {
+      const key_pubkey =
+        typeof key?.pubkey === "string" ? key.pubkey : key?.pubkey?.toBase58?.();
+      return Boolean(key?.signer) && key_pubkey === expected_wallet;
+    });
+    if (!signer_present) {
+      throw new app_error("prediction transaction missing expected wallet signer", 400);
+    }
+
+    for (const instruction of parsed.transaction.message.instructions as any[]) {
+      const instruction_program =
+        typeof instruction?.programId === "string"
+          ? instruction.programId
+          : instruction?.programId?.toBase58?.();
+      if (instruction_program !== expected_program) {
+        continue;
+      }
+      if (!Array.isArray(instruction?.accounts) || typeof instruction?.data !== "string") {
+        continue;
+      }
+
+      const accounts = instruction.accounts.map((account: any) =>
+        typeof account === "string" ? account : account?.toBase58?.()
+      );
+      if (accounts.length < 5) {
+        continue;
+      }
+      if (
+        accounts[0] !== expected_wallet ||
+        accounts[1] !== expected_market ||
+        accounts[2] !== expected_round ||
+        accounts[3] !== expected_position ||
+        accounts[4] !== expected_system_program
+      ) {
+        continue;
+      }
+
+      const decoded = this.decode_place_prediction_data(instruction.data);
+      if (decoded.side !== input.expected_side || decoded.amount_lamports !== input.expected_amount_lamports) {
+        throw new app_error("prediction transaction data mismatch", 400);
+      }
+      return;
+    }
+
+    throw new app_error("prediction instruction not found in transaction", 400);
+  }
+
+  private async get_parsed_transaction_with_retry(tx_signature: string): Promise<any | null> {
+    const max_attempts = 7;
+    let last_error: unknown = null;
+
+    for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
+      try {
+        const parsed = await this.er_connection.getParsedTransaction(tx_signature, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0
+        });
+        if (parsed) {
+          return parsed;
+        }
+      } catch (error) {
+        last_error = error;
+      }
+
+      if (attempt < max_attempts) {
+        await sleep(250 * attempt);
+      }
+    }
+
+    if (last_error) {
+      throw new app_error(`prediction transaction lookup failed: ${this.format_error(last_error)}`, 502);
+    }
+    return null;
+  }
+
+  private decode_place_prediction_data(data_base58: string): {
+    side: decision_side;
+    amount_lamports: number;
+  } {
+    let raw: Uint8Array;
+    try {
+      raw = bs58.decode(data_base58);
+    } catch {
+      throw new app_error("prediction instruction data is not base58", 400);
+    }
+
+    if (raw.length !== 17) {
+      throw new app_error("prediction instruction data length mismatch", 400);
+    }
+    const discriminator = raw.subarray(0, 8);
+    if (!Buffer.from(discriminator).equals(place_prediction_discriminator)) {
+      throw new app_error("unexpected instruction discriminator", 400);
+    }
+
+    const side_raw = raw[8];
+    let side: decision_side;
+    if (side_raw === 0) {
+      side = "yes";
+    } else if (side_raw === 1) {
+      side = "no";
+    } else if (side_raw === 2) {
+      side = "skip";
+    } else {
+      throw new app_error("invalid decision side", 400);
+    }
+
+    const amount_lamports = Number(Buffer.from(raw.subarray(9, 17)).readBigUInt64LE(0));
+    if (!Number.isSafeInteger(amount_lamports)) {
+      throw new app_error("invalid prediction amount", 400);
+    }
+
+    return { side, amount_lamports };
   }
 
   private decode_round_account(data_buffer: Buffer | Uint8Array): {

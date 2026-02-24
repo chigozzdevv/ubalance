@@ -108,6 +108,33 @@ export class rounds_service {
     };
   }
 
+  async prepare_relay_claim(
+    round_id: string,
+    wallet: string
+  ): Promise<{
+    transaction_base64: string;
+    blockhash: string;
+    last_valid_block_height: number;
+    fee_payer: string;
+  }> {
+    await this.mongo.ensure_ready();
+    this.schedule_refresh();
+
+    const round_document = await this.mongo.rounds_collection.findOne({ id: round_id });
+    if (!round_document) {
+      throw new app_error("round not found", 404);
+    }
+    if (round_document.status !== "resolved") {
+      throw new app_error("round is not resolved", 409);
+    }
+
+    return this.chain_admin.prepare_claim_payout_transaction({
+      user_wallet: wallet,
+      market_pda: round_document.market_pda,
+      round_pda: round_document.round_pda
+    });
+  }
+
   async upsert_action(
     round_id: string,
     wallet: string,
@@ -118,8 +145,22 @@ export class rounds_service {
     await this.mongo.ensure_ready();
     this.schedule_refresh();
 
-    await this.get_active_round_or_throw(round_id);
+    const round_document = await this.get_active_round_or_throw(round_id);
     const amount_to_store = this.normalize_amount_or_throw(side, amount_lamports);
+    if (side !== "skip" && !tx_signature) {
+      throw new app_error("tx signature is required for yes/no actions", 400);
+    }
+    if (tx_signature) {
+      await this.chain_admin.verify_prediction_transaction({
+        tx_signature,
+        expected_wallet: wallet,
+        expected_market_pda: round_document.market_pda,
+        expected_round_pda: round_document.round_pda,
+        expected_side: side,
+        expected_amount_lamports: amount_to_store
+      });
+    }
+
     const action_id = `${round_id}:${wallet}`;
     const existing_action = await this.mongo.round_actions_collection.findOne({ _id: action_id });
     const now = Date.now();

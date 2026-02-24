@@ -1,4 +1,4 @@
-import { PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
 import { Buffer } from "buffer";
 import type { decision_side } from "@/types/round";
 
@@ -36,6 +36,7 @@ export const create_place_prediction_instruction = (args: {
   user: PublicKey;
   market_pda: PublicKey;
   round_pda: PublicKey;
+  position_pda: PublicKey;
   side: decision_side;
   amount_lamports: number;
 }): TransactionInstruction => {
@@ -48,9 +49,11 @@ export const create_place_prediction_instruction = (args: {
   return new TransactionInstruction({
     programId: args.program_id,
     keys: [
-      { pubkey: args.user, isWritable: false, isSigner: true },
+      { pubkey: args.user, isWritable: true, isSigner: true },
       { pubkey: args.market_pda, isWritable: false, isSigner: false },
-      { pubkey: args.round_pda, isWritable: true, isSigner: false }
+      { pubkey: args.round_pda, isWritable: true, isSigner: false },
+      { pubkey: args.position_pda, isWritable: true, isSigner: false },
+      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
     ],
     data
   });

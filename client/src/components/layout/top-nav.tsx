@@ -14,6 +14,8 @@ type top_nav_props = {
   history: round_view[];
   amount_sol: number;
   on_amount_change: (value: number) => void;
+  on_claim_round: (round_id: string) => void;
+  claiming_round_id: string | null;
 };
 
 export const TopNav = ({
@@ -23,6 +25,8 @@ export const TopNav = ({
   history,
   amount_sol,
   on_amount_change,
+  on_claim_round,
+  claiming_round_id
 }: top_nav_props) => {
   const [history_open, set_history_open] = useState(false);
   const [amount_open, set_amount_open] = useState(false);
@@ -213,6 +217,17 @@ export const TopNav = ({
                             <span className={`font-bold ${round_item.winningSide === 'yes' ? 'text-[#89eeb0]' : round_item.winningSide === 'no' ? 'text-red-400' : 'text-[#e7efe9]'}`}>{round_item.winningSide ?? "pending"}</span>
                           </p>
                         </div>
+
+                        {round_item.status === "resolved" && (round_item.winningSide === "yes" || round_item.winningSide === "no") ? (
+                          <button
+                            type="button"
+                            className="mt-3 w-full rounded-lg border border-[#89eeb0]/40 bg-[#b9f6c9]/10 px-3 py-2 text-xs font-bold uppercase tracking-widest text-[#b9f6c9] transition hover:border-[#89eeb0] hover:bg-[#b9f6c9]/15 disabled:opacity-60"
+                            disabled={claiming_round_id === round_item.id}
+                            onClick={() => on_claim_round(round_item.id)}
+                          >
+                            {claiming_round_id === round_item.id ? "claiming..." : "claim payout"}
+                          </button>
+                        ) : null}
                       </article>
                     ))}
                   </div>

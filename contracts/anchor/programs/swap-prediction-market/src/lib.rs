@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::system_program::{transfer, Transfer};
 use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::{commit_accounts, commit_and_undelegate_accounts};
@@ -74,15 +75,47 @@ pub mod ubalance_prediction_market {
         amount_lamports: u64,
     ) -> Result<()> {
         let clock = Clock::get()?;
+        let user = &ctx.accounts.user;
         let round = &mut ctx.accounts.round;
+        let position = &mut ctx.accounts.position;
 
         require!(round.status == RoundStatus::Predicting as u8, ErrorCode::InvalidState);
         require!(clock.unix_timestamp < round.close_at_ts, ErrorCode::RoundClosed);
+
+        let is_uninitialized_position = position.user == Pubkey::default()
+            && position.round == Pubkey::default()
+            && position.amount_lamports == 0
+            && !position.claimed;
+
+        if is_uninitialized_position {
+            position.user = user.key();
+            position.round = round.key();
+            position.side = side.clone();
+            position.claimed = false;
+        } else {
+            require_keys_eq!(position.user, user.key(), ErrorCode::Unauthorized);
+            require_keys_eq!(position.round, round.key(), ErrorCode::InvalidPositionRound);
+            require!(!position.claimed, ErrorCode::PositionAlreadyClaimed);
+            require!(position.side == side, ErrorCode::PositionSideMismatch);
+            require!(side != DecisionSide::Skip, ErrorCode::PositionAlreadyPlaced);
+        }
+
         if side == DecisionSide::Skip {
             require!(amount_lamports == 0, ErrorCode::InvalidAmount);
-        } else {
-            require!(amount_lamports > 0, ErrorCode::InvalidAmount);
+            round.skip_total = round.skip_total.saturating_add(1);
+            return Ok(());
         }
+
+        require!(amount_lamports > 0, ErrorCode::InvalidAmount);
+        let transfer_context = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            Transfer {
+                from: user.to_account_info(),
+                to: round.to_account_info(),
+            },
+        );
+        transfer(transfer_context, amount_lamports)?;
+        position.amount_lamports = position.amount_lamports.saturating_add(amount_lamports);
 
         match side {
             DecisionSide::Yes => {
@@ -92,7 +125,7 @@ pub mod ubalance_prediction_market {
                 round.no_total = round.no_total.saturating_add(amount_lamports);
             }
             DecisionSide::Skip => {
-                round.skip_total = round.skip_total.saturating_add(1);
+                return err!(ErrorCode::InvalidAmount);
             }
         }
         Ok(())
@@ -122,6 +155,54 @@ pub mod ubalance_prediction_market {
         } else {
             DecisionSide::Skip
         });
+        Ok(())
+    }
+
+    pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
+        let round = &mut ctx.accounts.round;
+        let position = &mut ctx.accounts.position;
+        let user = &ctx.accounts.user;
+
+        require!(round.status == RoundStatus::Resolved as u8, ErrorCode::InvalidState);
+        require!(!position.claimed, ErrorCode::PositionAlreadyClaimed);
+        require_keys_eq!(position.user, user.key(), ErrorCode::Unauthorized);
+        require_keys_eq!(position.round, round.key(), ErrorCode::InvalidPositionRound);
+
+        let winning_side = round
+            .resolved_side
+            .clone()
+            .ok_or(error!(ErrorCode::RoundUnresolved))?;
+        require!(position.side == winning_side, ErrorCode::NotWinningPosition);
+        require!(position.amount_lamports > 0, ErrorCode::NoPayoutAvailable);
+
+        let winners_total = match winning_side {
+            DecisionSide::Yes => round.yes_total,
+            DecisionSide::No => round.no_total,
+            DecisionSide::Skip => 0,
+        };
+        require!(winners_total > 0, ErrorCode::NoPayoutAvailable);
+
+        let total_pool = round.yes_total.saturating_add(round.no_total);
+        let payout_u128 = (position.amount_lamports as u128)
+            .checked_mul(total_pool as u128)
+            .ok_or(error!(ErrorCode::MathOverflow))?
+            .checked_div(winners_total as u128)
+            .ok_or(error!(ErrorCode::MathOverflow))?;
+        let payout_lamports = u64::try_from(payout_u128).map_err(|_| error!(ErrorCode::MathOverflow))?;
+        require!(payout_lamports > 0, ErrorCode::NoPayoutAvailable);
+
+        let round_info = round.to_account_info();
+        let rent_minimum = Rent::get()?.minimum_balance(8 + Round::LEN);
+        let round_lamports = **round_info.lamports.borrow();
+        let transferable_lamports = round_lamports.saturating_sub(rent_minimum);
+        require!(
+            transferable_lamports >= payout_lamports,
+            ErrorCode::InsufficientPoolBalance
+        );
+
+        **round_info.try_borrow_mut_lamports()? -= payout_lamports;
+        **user.to_account_info().try_borrow_mut_lamports()? += payout_lamports;
+        position.claimed = true;
         Ok(())
     }
 
@@ -280,6 +361,7 @@ pub struct OpenRound<'info> {
 
 #[derive(Accounts)]
 pub struct PlacePrediction<'info> {
+    #[account(mut)]
     pub user: Signer<'info>,
     pub market: Account<'info, Market>,
     #[account(
@@ -288,6 +370,34 @@ pub struct PlacePrediction<'info> {
         bump,
     )]
     pub round: Account<'info, Round>,
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + Position::LEN,
+        seeds = [POSITION_SEED, round.key().as_ref(), user.key().as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, Position>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimPayout<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub market: Account<'info, Market>,
+    #[account(
+        mut,
+        seeds = [ROUND_SEED, market.key().as_ref(), &round.number.to_le_bytes()],
+        bump,
+    )]
+    pub round: Account<'info, Round>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, round.key().as_ref(), user.key().as_ref()],
+        bump,
+    )]
+    pub position: Account<'info, Position>,
 }
 
 #[derive(Accounts)]
@@ -359,6 +469,24 @@ pub enum ErrorCode {
     InvalidCloseTime,
     #[msg("Market inactive")]
     MarketInactive,
+    #[msg("Position side mismatch")]
+    PositionSideMismatch,
+    #[msg("Position already claimed")]
+    PositionAlreadyClaimed,
+    #[msg("Position already placed")]
+    PositionAlreadyPlaced,
+    #[msg("Position round mismatch")]
+    InvalidPositionRound,
+    #[msg("Position is not on the winning side")]
+    NotWinningPosition,
+    #[msg("No payout available")]
+    NoPayoutAvailable,
+    #[msg("Round unresolved")]
+    RoundUnresolved,
+    #[msg("Insufficient pool balance")]
+    InsufficientPoolBalance,
+    #[msg("Math overflow")]
+    MathOverflow,
 }
 
 fn derive_seeds_from_account_type(account_type: &AccountType) -> Vec<Vec<u8>> {

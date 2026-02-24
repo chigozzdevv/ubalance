@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import bs58 from "bs58";
-import { Transaction } from "@solana/web3.js";
+import { Connection, Transaction } from "@solana/web3.js";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { TopNav } from "@/components/layout/top-nav";
 
 import { SwipeCard } from "@/components/game/swipe-card";
 import { auth_api } from "@/lib/auth.api";
+import { env } from "@/lib/env";
 import { markets_api } from "@/lib/markets.api";
 import { rounds_api } from "@/lib/rounds.api";
 import type { market } from "@/types/market";
@@ -52,6 +53,7 @@ export const SingleGame = () => {
 
   const [status, set_status] = useState("ready");
   const [submitting, set_submitting] = useState(false);
+  const [claiming_round_id, set_claiming_round_id] = useState<string | null>(null);
 
   const available_timeframes = useMemo(() => {
     if (markets.length === 0) return [];
@@ -242,6 +244,68 @@ export const SingleGame = () => {
     [active_round, amount_sol, connection, ensure_wallet_and_auth, load_data, wallet]
   );
 
+  const claim_payout = useCallback(
+    async (round_id: string): Promise<void> => {
+      set_claiming_round_id(round_id);
+      try {
+        const token = await ensure_wallet_and_auth();
+        if (!token || !wallet.signTransaction) {
+          return;
+        }
+        const base_connection = new Connection(env.solanaRpcUrl, "confirmed");
+
+        let tx_signature: string | null = null;
+        let last_error: unknown = null;
+        const relay_max_attempts = 2;
+
+        for (let attempt = 1; attempt <= relay_max_attempts; attempt += 1) {
+          try {
+            const prepared = await rounds_api.prepare_relay_claim(round_id, token);
+            const unsigned_tx = Transaction.from(decode_base64(prepared.data.transactionBase64));
+            const signed_tx = await wallet.signTransaction(unsigned_tx);
+
+            tx_signature = await base_connection.sendRawTransaction(signed_tx.serialize(), {
+              preflightCommitment: "confirmed",
+              maxRetries: 3
+            });
+
+            const confirmation = await base_connection.confirmTransaction(
+              {
+                signature: tx_signature,
+                blockhash: prepared.data.blockhash,
+                lastValidBlockHeight: prepared.data.lastValidBlockHeight
+              },
+              "confirmed"
+            );
+            if (confirmation.value.err) {
+              throw new Error(JSON.stringify(confirmation.value.err));
+            }
+
+            break;
+          } catch (error: unknown) {
+            last_error = error;
+            if (attempt < relay_max_attempts && is_retryable_relay_error(error)) {
+              continue;
+            }
+            throw error;
+          }
+        }
+
+        if (!tx_signature) {
+          throw (last_error instanceof Error ? last_error : new Error("failed to relay claim transaction"));
+        }
+
+        set_status(`claim submitted (${tx_signature.slice(0, 8)}...)`);
+        await load_data();
+      } catch (error: any) {
+        set_status(error.message || "claim failed");
+      } finally {
+        set_claiming_round_id(null);
+      }
+    },
+    [ensure_wallet_and_auth, load_data, wallet]
+  );
+
 
 
   return (
@@ -253,6 +317,10 @@ export const SingleGame = () => {
         history={selected_history}
         amount_sol={amount_sol}
         on_amount_change={set_amount_sol}
+        on_claim_round={(round_id) => {
+          void claim_payout(round_id);
+        }}
+        claiming_round_id={claiming_round_id}
       />
 
       <main className="mx-auto flex w-full max-w-md flex-col gap-6 px-4 pt-10 md:px-6 relative z-10">

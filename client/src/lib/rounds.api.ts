@@ -32,6 +32,22 @@ export const rounds_api = {
     );
   },
 
+  prepare_relay_claim(round_id: string, session_token: string) {
+    return api.post<{
+      success: true;
+      data: {
+        transactionBase64: string;
+        blockhash: string;
+        lastValidBlockHeight: number;
+        feePayer: string;
+      };
+    }>(
+      `/rounds/${round_id}/claims/relay-prepare`,
+      {},
+      session_token
+    );
+  },
+
   submit_action(
     round_id: string,
     side: decision_side,

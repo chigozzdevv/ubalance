@@ -98,6 +98,30 @@ export class rounds_controller {
     }
   };
 
+  prepare_relay_claim = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const wallet = request.auth_wallet;
+      if (!wallet) {
+        reply.code(401).send({ success: false, message: "unauthorized" });
+        return;
+      }
+
+      const round_id = (request.params as any).roundId as string;
+      const prepared = await this.service.prepare_relay_claim(round_id, wallet);
+
+      reply.send(
+        ok({
+          transactionBase64: prepared.transaction_base64,
+          blockhash: prepared.blockhash,
+          lastValidBlockHeight: prepared.last_valid_block_height,
+          feePayer: prepared.fee_payer
+        })
+      );
+    } catch (error: unknown) {
+      this.handle_error(error, reply);
+    }
+  };
+
   private handle_error(error: unknown, reply: FastifyReply): void {
     if (error instanceof app_error) {
       reply.code(error.status_code).send({ success: false, message: error.message });

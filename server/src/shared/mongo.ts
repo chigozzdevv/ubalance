@@ -1,6 +1,10 @@
 import { MongoClient, type Collection, type Db } from "mongodb";
 import { env } from "@/config/env";
 
+const sleep = async (ms: number): Promise<void> => {
+  await new Promise((resolve_sleep) => setTimeout(resolve_sleep, ms));
+};
+
 export type market_document = {
   _id: string;
   slug: string;
@@ -81,18 +85,57 @@ export class mongo_service {
   round_actions_collection!: Collection<round_action_document>;
   auth_challenges_collection!: Collection<auth_challenge_document>;
   auth_sessions_collection!: Collection<auth_session_document>;
-  private readonly init_promise: Promise<void>;
+  private init_promise: Promise<void> | null = null;
+  private initialized = false;
 
   constructor() {
-    this.client = new MongoClient(env.MONGODB_URI);
-    this.init_promise = this.initialize();
+    this.client = new MongoClient(env.MONGODB_URI, {
+      serverSelectionTimeoutMS: 7_000,
+      connectTimeoutMS: 7_000,
+      socketTimeoutMS: 20_000
+    });
   }
 
   async ensure_ready(): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
+    if (!this.init_promise) {
+      this.init_promise = this.initialize_with_retry()
+        .then(() => {
+          this.initialized = true;
+        })
+        .finally(() => {
+          this.init_promise = null;
+        });
+    }
+
     await this.init_promise;
   }
 
-  private async initialize(): Promise<void> {
+  private async initialize_with_retry(): Promise<void> {
+    const max_attempts = 3;
+    let last_error: unknown = null;
+
+    for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
+      try {
+        await this.initialize_once();
+        return;
+      } catch (error) {
+        last_error = error;
+        if (attempt >= max_attempts) {
+          break;
+        }
+        const delay_ms = Math.min(4_000, 400 * attempt);
+        await sleep(delay_ms);
+      }
+    }
+
+    throw (last_error instanceof Error ? last_error : new Error("failed to initialize MongoDB connection"));
+  }
+
+  private async initialize_once(): Promise<void> {
     await this.client.connect();
     this.db = this.client.db(env.MONGODB_DB_NAME);
     this.markets_collection = this.db.collection<market_document>("markets");
