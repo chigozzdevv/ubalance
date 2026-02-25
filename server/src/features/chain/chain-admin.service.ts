@@ -8,18 +8,39 @@ import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction } f
 import { env } from "@/config/env";
 import { app_error } from "@/shared/app-error";
 import {
+  create_cancel_match_instruction,
+  create_claim_ai_duel_payout_instruction,
+  create_claim_match_payout_instruction,
   create_claim_payout_instruction,
-  create_initialize_market_instruction,
+  create_commit_and_undelegate_pda_instruction,
   create_commit_and_undelegate_round_instruction,
+  create_create_match_instruction,
+  create_finalize_match_instruction,
+  create_fund_house_bankroll_instruction,
+  create_init_house_bankroll_instruction,
+  create_initialize_market_instruction,
+  create_join_match_instruction,
+  create_lock_match_instruction,
   create_lock_round_instruction,
+  create_open_ai_duel_instruction,
   create_open_round_instruction,
   create_place_prediction_instruction,
   create_program_delegate_pda_instruction,
   create_resolve_round_instruction,
+  create_reveal_ai_duel_instruction,
+  create_set_house_bankroll_active_instruction,
   create_set_market_active_instruction,
+  create_set_match_entry_result_instruction,
+  create_settle_ai_duel_instruction,
+  create_withdraw_house_bankroll_instruction,
+  derive_ai_duel_pda,
+  derive_house_bankroll_pda,
   derive_market_pda,
+  derive_match_entry_pda,
+  derive_match_pda,
   derive_position_pda,
   derive_round_pda,
+  type account_type,
   type decision_side
 } from "@/features/chain/ubalance-program";
 
@@ -81,10 +102,28 @@ const sleep = async (ms: number): Promise<void> => {
   await new Promise((resolve_sleep) => setTimeout(resolve_sleep, ms));
 };
 
-const place_prediction_discriminator = createHash("sha256")
-  .update("global:place_prediction")
-  .digest()
-  .subarray(0, 8);
+const discriminator = (instruction_name: string): Buffer => {
+  return createHash("sha256").update(`global:${instruction_name}`).digest().subarray(0, 8);
+};
+
+const place_prediction_discriminator = discriminator("place_prediction");
+const join_match_discriminator = discriminator("join_match");
+const claim_match_payout_discriminator = discriminator("claim_match_payout");
+const open_ai_duel_discriminator = discriminator("open_ai_duel");
+const claim_ai_duel_payout_discriminator = discriminator("claim_ai_duel_payout");
+
+const side_from_raw = (raw: number): decision_side => {
+  if (raw === 0) {
+    return "yes";
+  }
+  if (raw === 1) {
+    return "no";
+  }
+  if (raw === 2) {
+    return "skip";
+  }
+  throw new app_error("invalid decision side", 400);
+};
 
 export class chain_admin_service {
   readonly base_connection: Connection;
@@ -115,6 +154,25 @@ export class chain_admin_service {
   derive_round_pda(market_index: number, round_number: number): PublicKey {
     const market_pda = this.derive_market_pda(market_index);
     return derive_round_pda(this.program_id, market_pda, round_number);
+  }
+
+  derive_match_pda(market_index: number, match_id: number): PublicKey {
+    const market_pda = this.derive_market_pda(market_index);
+    return derive_match_pda(this.program_id, market_pda, match_id);
+  }
+
+  derive_match_entry_pda(market_index: number, match_id: number, player_wallet: string): PublicKey {
+    const match_pda = this.derive_match_pda(market_index, match_id);
+    return derive_match_entry_pda(this.program_id, match_pda, new PublicKey(player_wallet));
+  }
+
+  derive_house_bankroll_pda(): PublicKey {
+    return derive_house_bankroll_pda(this.program_id, this.admin.publicKey);
+  }
+
+  derive_ai_duel_pda(market_index: number, player_wallet: string, duel_id: number): PublicKey {
+    const market_pda = this.derive_market_pda(market_index);
+    return derive_ai_duel_pda(this.program_id, market_pda, new PublicKey(player_wallet), duel_id);
   }
 
   async get_next_round_number(market_index: number): Promise<number> {
@@ -252,12 +310,183 @@ export class chain_admin_service {
     throw new app_error(`open round failed: ${this.format_error(last_error)}`, 502);
   }
 
+  async create_match(input: {
+    market_index: number;
+    match_id: number;
+    buy_in_lamports: number;
+    max_players: number;
+    start_at_ms: number;
+    end_at_ms: number;
+  }): Promise<{ match_pda: string; create_tx_signature: string }> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
+
+    const create_match_ix = create_create_match_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      match_pda,
+      match_id: input.match_id,
+      buy_in_lamports: input.buy_in_lamports,
+      max_players: input.max_players,
+      start_at_ts: Math.floor(input.start_at_ms / 1000),
+      end_at_ts: Math.floor(input.end_at_ms / 1000)
+    });
+
+    const create_tx_signature = await this.send_base_transaction([create_match_ix], "create match");
+    return {
+      match_pda: match_pda.toBase58(),
+      create_tx_signature
+    };
+  }
+
+  async lock_match(input: { market_index: number; match_id: number }): Promise<string> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
+
+    const lock_match_ix = create_lock_match_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      match_pda
+    });
+
+    return this.send_base_transaction([lock_match_ix], "lock match");
+  }
+
+  async set_match_entry_result(input: {
+    market_index: number;
+    match_id: number;
+    player_wallet: string;
+    score: number;
+    is_winner: boolean;
+  }): Promise<string> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
+    const match_entry_pda = derive_match_entry_pda(this.program_id, match_pda, new PublicKey(input.player_wallet));
+
+    const set_result_ix = create_set_match_entry_result_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      match_pda,
+      match_entry_pda,
+      score: input.score,
+      is_winner: input.is_winner
+    });
+
+    return this.send_base_transaction([set_result_ix], "set match result");
+  }
+
+  async finalize_match(input: { market_index: number; match_id: number }): Promise<string> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
+
+    const finalize_ix = create_finalize_match_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      match_pda
+    });
+
+    return this.send_base_transaction([finalize_ix], "finalize match");
+  }
+
+  async cancel_match(input: { market_index: number; match_id: number }): Promise<string> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
+
+    const cancel_ix = create_cancel_match_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      match_pda
+    });
+
+    return this.send_base_transaction([cancel_ix], "cancel match");
+  }
+
+  async ensure_house_bankroll_initialized(): Promise<{ house_bankroll_pda: string; initialize_tx_signature: string | null }> {
+    const house_bankroll_pda = this.derive_house_bankroll_pda();
+    const existing = await this.base_connection.getAccountInfo(house_bankroll_pda, "confirmed");
+    if (existing) {
+      return { house_bankroll_pda: house_bankroll_pda.toBase58(), initialize_tx_signature: null };
+    }
+
+    const initialize_ix = create_init_house_bankroll_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      house_bankroll_pda
+    });
+
+    const activate_ix = create_set_house_bankroll_active_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      house_bankroll_pda,
+      active: true
+    });
+
+    try {
+      const signature = await this.send_base_transaction([initialize_ix, activate_ix], "init house bankroll");
+      return { house_bankroll_pda: house_bankroll_pda.toBase58(), initialize_tx_signature: signature };
+    } catch (error) {
+      const existing_after_error = await this.base_connection.getAccountInfo(house_bankroll_pda, "confirmed");
+      if (existing_after_error) {
+        return { house_bankroll_pda: house_bankroll_pda.toBase58(), initialize_tx_signature: null };
+      }
+      throw error;
+    }
+  }
+
+  async set_house_bankroll_active(active: boolean): Promise<string> {
+    const house_bankroll_pda = this.derive_house_bankroll_pda();
+    const ix = create_set_house_bankroll_active_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      house_bankroll_pda,
+      active
+    });
+    return this.send_base_transaction([ix], "set house bankroll active");
+  }
+
+  async fund_house_bankroll(amount_lamports: number): Promise<string> {
+    const house_bankroll_pda = this.derive_house_bankroll_pda();
+    const ix = create_fund_house_bankroll_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      house_bankroll_pda,
+      amount_lamports
+    });
+    return this.send_base_transaction([ix], "fund house bankroll");
+  }
+
+  async withdraw_house_bankroll(amount_lamports: number): Promise<string> {
+    const house_bankroll_pda = this.derive_house_bankroll_pda();
+    const ix = create_withdraw_house_bankroll_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      house_bankroll_pda,
+      amount_lamports
+    });
+    return this.send_base_transaction([ix], "withdraw house bankroll");
+  }
+
+  async get_house_bankroll_balance_lamports(): Promise<number> {
+    const house_bankroll_pda = this.derive_house_bankroll_pda();
+    return this.base_connection.getBalance(house_bankroll_pda, "confirmed");
+  }
+
   async is_round_delegated(input: { market_index: number; round_number: number }): Promise<boolean> {
     const market_pda = this.derive_market_pda(input.market_index);
     const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
-    const account = await this.base_connection.getAccountInfo(round_pda, "confirmed");
+    return this.is_pda_delegated(round_pda);
+  }
+
+  async is_pda_delegated(pda: PublicKey | string): Promise<boolean> {
+    const key = this.to_public_key(pda);
+    const account = await this.base_connection.getAccountInfo(key, "confirmed");
     if (!account) {
-      throw new app_error("round account not found on base layer", 404);
+      throw new app_error("account not found on base layer", 404);
     }
 
     return account.owner.equals(DELEGATION_PROGRAM_ID);
@@ -267,19 +496,27 @@ export class chain_admin_service {
     const market_pda = this.derive_market_pda(input.market_index);
     const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
 
-    const delegate_account_ix = create_program_delegate_pda_instruction({
-      program_id: this.program_id,
-      payer: this.admin.publicKey,
+    return this.delegate_account({
       pda: round_pda,
       account_type: {
         kind: "round",
         market: market_pda,
         round_number: input.round_number
-      },
+      }
+    });
+  }
+
+  async delegate_account(input: { pda: PublicKey | string; account_type: account_type }): Promise<string> {
+    const pda = this.to_public_key(input.pda);
+    const delegate_account_ix = create_program_delegate_pda_instruction({
+      program_id: this.program_id,
+      payer: this.admin.publicKey,
+      pda,
+      account_type: input.account_type,
       validator: this.validator
     });
 
-    return this.send_base_transaction([delegate_account_ix], "delegate round account");
+    return this.send_base_transaction([delegate_account_ix], "delegate account");
   }
 
   async commit_and_undelegate_round(input: { market_index: number; round_number: number }): Promise<{
@@ -304,7 +541,39 @@ export class chain_admin_service {
       // Best-effort helper only; ownership polling below enforces final state.
     }
 
-    await this.wait_for_round_owner(round_pda, this.program_id, 20_000);
+    await this.wait_for_account_owner(round_pda, this.program_id, 20_000);
+
+    return {
+      er_tx_signature,
+      base_commit_tx_signature
+    };
+  }
+
+  async commit_and_undelegate_account(input: {
+    pda: PublicKey | string;
+    account_type: account_type;
+    timeout_ms?: number;
+  }): Promise<{
+    er_tx_signature: string;
+    base_commit_tx_signature: string | null;
+  }> {
+    const pda = this.to_public_key(input.pda);
+    const ix = create_commit_and_undelegate_pda_instruction({
+      program_id: this.program_id,
+      payer: this.admin.publicKey,
+      pda,
+      account_type: input.account_type
+    });
+
+    const er_tx_signature = await this.send_er_transaction([ix], "commit and undelegate account");
+    let base_commit_tx_signature: string | null = null;
+    try {
+      base_commit_tx_signature = await GetCommitmentSignature(er_tx_signature, this.er_connection);
+    } catch {
+      // Best-effort helper only; ownership polling below enforces final state.
+    }
+
+    await this.wait_for_account_owner(pda, this.program_id, input.timeout_ms ?? 20_000);
 
     return {
       er_tx_signature,
@@ -367,26 +636,7 @@ export class chain_admin_service {
       amount_lamports: input.amount_lamports
     });
 
-    const latest = await this.er_connection.getLatestBlockhash("confirmed");
-    const transaction = new Transaction({
-      feePayer: this.admin.publicKey,
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight
-    });
-    transaction.add(place_prediction_ix);
-    transaction.partialSign(this.admin);
-
-    return {
-      transaction_base64: transaction
-        .serialize({
-          requireAllSignatures: false,
-          verifySignatures: false
-        })
-        .toString("base64"),
-      blockhash: latest.blockhash,
-      last_valid_block_height: latest.lastValidBlockHeight,
-      fee_payer: this.admin.publicKey.toBase58()
-    };
+    return this.prepare_transaction(this.er_connection, place_prediction_ix);
   }
 
   async prepare_claim_payout_transaction(input: {
@@ -407,25 +657,176 @@ export class chain_admin_service {
       position_pda: position
     });
 
-    const latest = await this.base_connection.getLatestBlockhash("confirmed");
-    const transaction = new Transaction({
-      feePayer: this.admin.publicKey,
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight
-    });
-    transaction.add(claim_payout_ix);
-    transaction.partialSign(this.admin);
+    return this.prepare_transaction(this.base_connection, claim_payout_ix);
+  }
 
+  async prepare_join_match_transaction(input: {
+    user_wallet: string;
+    market_index: number;
+    match_id: number;
+  }): Promise<prepared_prediction_transaction & { match_pda: string; match_entry_pda: string }> {
+    const player = new PublicKey(input.user_wallet);
+    const market_pda = this.derive_market_pda(input.market_index);
+    const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
+    const match_entry_pda = derive_match_entry_pda(this.program_id, match_pda, player);
+
+    const join_match_ix = create_join_match_instruction({
+      program_id: this.program_id,
+      player,
+      match_pda,
+      match_entry_pda
+    });
+
+    const prepared = await this.prepare_transaction(this.er_connection, join_match_ix);
     return {
-      transaction_base64: transaction
-        .serialize({
-          requireAllSignatures: false,
-          verifySignatures: false
-        })
-        .toString("base64"),
-      blockhash: latest.blockhash,
-      last_valid_block_height: latest.lastValidBlockHeight,
-      fee_payer: this.admin.publicKey.toBase58()
+      ...prepared,
+      match_pda: match_pda.toBase58(),
+      match_entry_pda: match_entry_pda.toBase58()
+    };
+  }
+
+  async prepare_claim_match_payout_transaction(input: {
+    user_wallet: string;
+    market_index: number;
+    match_id: number;
+  }): Promise<prepared_prediction_transaction & { match_pda: string; match_entry_pda: string }> {
+    const player = new PublicKey(input.user_wallet);
+    const market_pda = this.derive_market_pda(input.market_index);
+    const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
+    const match_entry_pda = derive_match_entry_pda(this.program_id, match_pda, player);
+
+    const claim_ix = create_claim_match_payout_instruction({
+      program_id: this.program_id,
+      player,
+      match_pda,
+      match_entry_pda
+    });
+
+    const prepared = await this.prepare_transaction(this.base_connection, claim_ix);
+    return {
+      ...prepared,
+      match_pda: match_pda.toBase58(),
+      match_entry_pda: match_entry_pda.toBase58()
+    };
+  }
+
+  async prepare_open_ai_duel_transaction(input: {
+    user_wallet: string;
+    market_index: number;
+    round_number: number;
+    duel_id: number;
+    player_side: decision_side;
+    amount_lamports: number;
+    ai_commitment: Uint8Array;
+  }): Promise<prepared_prediction_transaction & {
+    market_pda: string;
+    round_pda: string;
+    house_bankroll_pda: string;
+    ai_duel_pda: string;
+  }> {
+    const player = new PublicKey(input.user_wallet);
+    const market_pda = this.derive_market_pda(input.market_index);
+    const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
+    const house_bankroll_pda = derive_house_bankroll_pda(this.program_id, this.admin.publicKey);
+    const ai_duel_pda = derive_ai_duel_pda(this.program_id, market_pda, player, input.duel_id);
+
+    const ix = create_open_ai_duel_instruction({
+      program_id: this.program_id,
+      player,
+      market_pda,
+      round_pda,
+      house_bankroll_pda,
+      ai_duel_pda,
+      duel_id: input.duel_id,
+      player_side: input.player_side,
+      amount_lamports: input.amount_lamports,
+      ai_commitment: input.ai_commitment
+    });
+
+    const prepared = await this.prepare_transaction(this.er_connection, ix);
+    return {
+      ...prepared,
+      market_pda: market_pda.toBase58(),
+      round_pda: round_pda.toBase58(),
+      house_bankroll_pda: house_bankroll_pda.toBase58(),
+      ai_duel_pda: ai_duel_pda.toBase58()
+    };
+  }
+
+  async reveal_ai_duel(input: {
+    market_index: number;
+    player_wallet: string;
+    duel_id: number;
+    ai_side: decision_side;
+    nonce: Uint8Array;
+  }): Promise<string> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const ai_duel_pda = derive_ai_duel_pda(
+      this.program_id,
+      market_pda,
+      new PublicKey(input.player_wallet),
+      input.duel_id
+    );
+
+    const reveal_ix = create_reveal_ai_duel_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      ai_duel_pda,
+      ai_side: input.ai_side,
+      nonce: input.nonce
+    });
+
+    return this.send_base_transaction([reveal_ix], "reveal ai duel");
+  }
+
+  async settle_ai_duel(input: {
+    market_index: number;
+    player_wallet: string;
+    duel_id: number;
+    round_number: number;
+  }): Promise<string> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
+    const house_bankroll_pda = derive_house_bankroll_pda(this.program_id, this.admin.publicKey);
+    const ai_duel_pda = derive_ai_duel_pda(
+      this.program_id,
+      market_pda,
+      new PublicKey(input.player_wallet),
+      input.duel_id
+    );
+
+    const settle_ix = create_settle_ai_duel_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      round_pda,
+      house_bankroll_pda,
+      ai_duel_pda
+    });
+
+    return this.send_base_transaction([settle_ix], "settle ai duel");
+  }
+
+  async prepare_claim_ai_duel_payout_transaction(input: {
+    user_wallet: string;
+    market_index: number;
+    duel_id: number;
+  }): Promise<prepared_prediction_transaction & { ai_duel_pda: string }> {
+    const player = new PublicKey(input.user_wallet);
+    const market_pda = this.derive_market_pda(input.market_index);
+    const ai_duel_pda = derive_ai_duel_pda(this.program_id, market_pda, player, input.duel_id);
+
+    const claim_ix = create_claim_ai_duel_payout_instruction({
+      program_id: this.program_id,
+      player,
+      ai_duel_pda
+    });
+
+    const prepared = await this.prepare_transaction(this.base_connection, claim_ix);
+    return {
+      ...prepared,
+      ai_duel_pda: ai_duel_pda.toBase58()
     };
   }
 
@@ -437,7 +838,7 @@ export class chain_admin_service {
     expected_side: decision_side;
     expected_amount_lamports: number;
   }): Promise<void> {
-    const parsed = await this.get_parsed_transaction_with_retry(input.tx_signature);
+    const parsed = await this.get_parsed_transaction_with_retry(this.er_connection, input.tx_signature);
 
     if (!parsed) {
       throw new app_error("prediction transaction not found", 400);
@@ -456,14 +857,8 @@ export class chain_admin_service {
     ).toBase58();
     const expected_program = this.program_id.toBase58();
     const expected_system_program = "11111111111111111111111111111111";
-    const signer_present = parsed.transaction.message.accountKeys.some((key: any) => {
-      const key_pubkey =
-        typeof key?.pubkey === "string" ? key.pubkey : key?.pubkey?.toBase58?.();
-      return Boolean(key?.signer) && key_pubkey === expected_wallet;
-    });
-    if (!signer_present) {
-      throw new app_error("prediction transaction missing expected wallet signer", 400);
-    }
+
+    this.require_signer(parsed, expected_wallet, "prediction transaction missing expected wallet signer");
 
     for (const instruction of parsed.transaction.message.instructions as any[]) {
       const instruction_program =
@@ -503,13 +898,287 @@ export class chain_admin_service {
     throw new app_error("prediction instruction not found in transaction", 400);
   }
 
-  private async get_parsed_transaction_with_retry(tx_signature: string): Promise<any | null> {
+  async verify_join_match_transaction(input: {
+    tx_signature: string;
+    expected_wallet: string;
+    expected_match_pda: string;
+    expected_match_entry_pda: string;
+  }): Promise<void> {
+    const parsed = await this.get_parsed_transaction_with_retry(this.er_connection, input.tx_signature);
+    if (!parsed) {
+      throw new app_error("join match transaction not found", 400);
+    }
+    if (parsed.meta?.err) {
+      throw new app_error("join match transaction failed", 400);
+    }
+
+    const expected_wallet = new PublicKey(input.expected_wallet).toBase58();
+    const expected_match = new PublicKey(input.expected_match_pda).toBase58();
+    const expected_entry = new PublicKey(input.expected_match_entry_pda).toBase58();
+    const expected_program = this.program_id.toBase58();
+    const expected_system_program = "11111111111111111111111111111111";
+
+    this.require_signer(parsed, expected_wallet, "join match transaction missing expected wallet signer");
+
+    for (const instruction of parsed.transaction.message.instructions as any[]) {
+      const instruction_program =
+        typeof instruction?.programId === "string"
+          ? instruction.programId
+          : instruction?.programId?.toBase58?.();
+      if (instruction_program !== expected_program) {
+        continue;
+      }
+      if (!Array.isArray(instruction?.accounts) || typeof instruction?.data !== "string") {
+        continue;
+      }
+
+      const accounts = instruction.accounts.map((account: any) =>
+        typeof account === "string" ? account : account?.toBase58?.()
+      );
+      if (accounts.length < 4) {
+        continue;
+      }
+
+      if (
+        accounts[0] !== expected_wallet ||
+        accounts[1] !== expected_match ||
+        accounts[2] !== expected_entry ||
+        accounts[3] !== expected_system_program
+      ) {
+        continue;
+      }
+
+      this.require_instruction_discriminator(instruction.data, join_match_discriminator, 8, "join_match");
+      return;
+    }
+
+    throw new app_error("join_match instruction not found in transaction", 400);
+  }
+
+  async verify_claim_match_payout_transaction(input: {
+    tx_signature: string;
+    expected_wallet: string;
+    expected_match_pda: string;
+    expected_match_entry_pda: string;
+  }): Promise<void> {
+    const parsed = await this.get_parsed_transaction_with_retry(this.base_connection, input.tx_signature);
+    if (!parsed) {
+      throw new app_error("claim match payout transaction not found", 400);
+    }
+    if (parsed.meta?.err) {
+      throw new app_error("claim match payout transaction failed", 400);
+    }
+
+    const expected_wallet = new PublicKey(input.expected_wallet).toBase58();
+    const expected_match = new PublicKey(input.expected_match_pda).toBase58();
+    const expected_entry = new PublicKey(input.expected_match_entry_pda).toBase58();
+    const expected_program = this.program_id.toBase58();
+
+    this.require_signer(parsed, expected_wallet, "claim payout transaction missing expected wallet signer");
+
+    for (const instruction of parsed.transaction.message.instructions as any[]) {
+      const instruction_program =
+        typeof instruction?.programId === "string"
+          ? instruction.programId
+          : instruction?.programId?.toBase58?.();
+      if (instruction_program !== expected_program) {
+        continue;
+      }
+      if (!Array.isArray(instruction?.accounts) || typeof instruction?.data !== "string") {
+        continue;
+      }
+
+      const accounts = instruction.accounts.map((account: any) =>
+        typeof account === "string" ? account : account?.toBase58?.()
+      );
+      if (accounts.length < 3) {
+        continue;
+      }
+
+      if (
+        accounts[0] !== expected_wallet ||
+        accounts[1] !== expected_match ||
+        accounts[2] !== expected_entry
+      ) {
+        continue;
+      }
+
+      this.require_instruction_discriminator(
+        instruction.data,
+        claim_match_payout_discriminator,
+        8,
+        "claim_match_payout"
+      );
+      return;
+    }
+
+    throw new app_error("claim_match_payout instruction not found in transaction", 400);
+  }
+
+  async verify_open_ai_duel_transaction(input: {
+    tx_signature: string;
+    expected_wallet: string;
+    expected_market_pda: string;
+    expected_round_pda: string;
+    expected_house_bankroll_pda: string;
+    expected_ai_duel_pda: string;
+    expected_duel_id: number;
+    expected_player_side: decision_side;
+    expected_amount_lamports: number;
+    expected_ai_commitment: Uint8Array;
+  }): Promise<void> {
+    const parsed = await this.get_parsed_transaction_with_retry(this.er_connection, input.tx_signature);
+    if (!parsed) {
+      throw new app_error("open ai duel transaction not found", 400);
+    }
+    if (parsed.meta?.err) {
+      throw new app_error("open ai duel transaction failed", 400);
+    }
+
+    const expected_wallet = new PublicKey(input.expected_wallet).toBase58();
+    const expected_market = new PublicKey(input.expected_market_pda).toBase58();
+    const expected_round = new PublicKey(input.expected_round_pda).toBase58();
+    const expected_house = new PublicKey(input.expected_house_bankroll_pda).toBase58();
+    const expected_duel = new PublicKey(input.expected_ai_duel_pda).toBase58();
+    const expected_program = this.program_id.toBase58();
+    const expected_system_program = "11111111111111111111111111111111";
+
+    this.require_signer(parsed, expected_wallet, "open ai duel transaction missing expected wallet signer");
+
+    for (const instruction of parsed.transaction.message.instructions as any[]) {
+      const instruction_program =
+        typeof instruction?.programId === "string"
+          ? instruction.programId
+          : instruction?.programId?.toBase58?.();
+      if (instruction_program !== expected_program) {
+        continue;
+      }
+      if (!Array.isArray(instruction?.accounts) || typeof instruction?.data !== "string") {
+        continue;
+      }
+
+      const accounts = instruction.accounts.map((account: any) =>
+        typeof account === "string" ? account : account?.toBase58?.()
+      );
+      if (accounts.length < 6) {
+        continue;
+      }
+
+      if (
+        accounts[0] !== expected_wallet ||
+        accounts[1] !== expected_market ||
+        accounts[2] !== expected_round ||
+        accounts[3] !== expected_house ||
+        accounts[4] !== expected_duel ||
+        accounts[5] !== expected_system_program
+      ) {
+        continue;
+      }
+
+      const decoded = this.decode_open_ai_duel_data(instruction.data);
+      const expected_commitment = Buffer.from(input.expected_ai_commitment);
+      if (
+        decoded.duel_id !== input.expected_duel_id ||
+        decoded.player_side !== input.expected_player_side ||
+        decoded.amount_lamports !== input.expected_amount_lamports ||
+        !decoded.ai_commitment.equals(expected_commitment)
+      ) {
+        throw new app_error("open ai duel transaction data mismatch", 400);
+      }
+      return;
+    }
+
+    throw new app_error("open_ai_duel instruction not found in transaction", 400);
+  }
+
+  async verify_claim_ai_duel_payout_transaction(input: {
+    tx_signature: string;
+    expected_wallet: string;
+    expected_ai_duel_pda: string;
+  }): Promise<void> {
+    const parsed = await this.get_parsed_transaction_with_retry(this.base_connection, input.tx_signature);
+    if (!parsed) {
+      throw new app_error("claim ai duel payout transaction not found", 400);
+    }
+    if (parsed.meta?.err) {
+      throw new app_error("claim ai duel payout transaction failed", 400);
+    }
+
+    const expected_wallet = new PublicKey(input.expected_wallet).toBase58();
+    const expected_ai_duel = new PublicKey(input.expected_ai_duel_pda).toBase58();
+    const expected_program = this.program_id.toBase58();
+
+    this.require_signer(parsed, expected_wallet, "claim ai duel payout transaction missing expected wallet signer");
+
+    for (const instruction of parsed.transaction.message.instructions as any[]) {
+      const instruction_program =
+        typeof instruction?.programId === "string"
+          ? instruction.programId
+          : instruction?.programId?.toBase58?.();
+      if (instruction_program !== expected_program) {
+        continue;
+      }
+      if (!Array.isArray(instruction?.accounts) || typeof instruction?.data !== "string") {
+        continue;
+      }
+
+      const accounts = instruction.accounts.map((account: any) =>
+        typeof account === "string" ? account : account?.toBase58?.()
+      );
+      if (accounts.length < 2) {
+        continue;
+      }
+
+      if (accounts[0] !== expected_wallet || accounts[1] !== expected_ai_duel) {
+        continue;
+      }
+
+      this.require_instruction_discriminator(
+        instruction.data,
+        claim_ai_duel_payout_discriminator,
+        8,
+        "claim_ai_duel_payout"
+      );
+      return;
+    }
+
+    throw new app_error("claim_ai_duel_payout instruction not found in transaction", 400);
+  }
+
+  private async prepare_transaction(
+    connection: Connection,
+    instruction: TransactionInstruction
+  ): Promise<prepared_prediction_transaction> {
+    const latest = await connection.getLatestBlockhash("confirmed");
+    const transaction = new Transaction({
+      feePayer: this.admin.publicKey,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight
+    });
+
+    transaction.add(instruction);
+    transaction.partialSign(this.admin);
+
+    return {
+      transaction_base64: transaction
+        .serialize({
+          requireAllSignatures: false,
+          verifySignatures: false
+        })
+        .toString("base64"),
+      blockhash: latest.blockhash,
+      last_valid_block_height: latest.lastValidBlockHeight,
+      fee_payer: this.admin.publicKey.toBase58()
+    };
+  }
+
+  private async get_parsed_transaction_with_retry(connection: Connection, tx_signature: string): Promise<any | null> {
     const max_attempts = 7;
     let last_error: unknown = null;
 
     for (let attempt = 1; attempt <= max_attempts; attempt += 1) {
       try {
-        const parsed = await this.er_connection.getParsedTransaction(tx_signature, {
+        const parsed = await connection.getParsedTransaction(tx_signature, {
           commitment: "confirmed",
           maxSupportedTransactionVersion: 0
         });
@@ -526,7 +1195,7 @@ export class chain_admin_service {
     }
 
     if (last_error) {
-      throw new app_error(`prediction transaction lookup failed: ${this.format_error(last_error)}`, 502);
+      throw new app_error(`transaction lookup failed: ${this.format_error(last_error)}`, 502);
     }
     return null;
   }
@@ -535,39 +1204,94 @@ export class chain_admin_service {
     side: decision_side;
     amount_lamports: number;
   } {
-    let raw: Uint8Array;
-    try {
-      raw = bs58.decode(data_base58);
-    } catch {
-      throw new app_error("prediction instruction data is not base58", 400);
-    }
+    const raw = this.decode_instruction_data(data_base58);
 
     if (raw.length !== 17) {
       throw new app_error("prediction instruction data length mismatch", 400);
     }
-    const discriminator = raw.subarray(0, 8);
-    if (!Buffer.from(discriminator).equals(place_prediction_discriminator)) {
+    const discriminator_raw = raw.subarray(0, 8);
+    if (!Buffer.from(discriminator_raw).equals(place_prediction_discriminator)) {
       throw new app_error("unexpected instruction discriminator", 400);
     }
 
-    const side_raw = raw[8];
-    let side: decision_side;
-    if (side_raw === 0) {
-      side = "yes";
-    } else if (side_raw === 1) {
-      side = "no";
-    } else if (side_raw === 2) {
-      side = "skip";
-    } else {
-      throw new app_error("invalid decision side", 400);
-    }
-
+    const side = side_from_raw(raw[8]);
     const amount_lamports = Number(Buffer.from(raw.subarray(9, 17)).readBigUInt64LE(0));
     if (!Number.isSafeInteger(amount_lamports)) {
       throw new app_error("invalid prediction amount", 400);
     }
 
     return { side, amount_lamports };
+  }
+
+  private decode_open_ai_duel_data(data_base58: string): {
+    duel_id: number;
+    player_side: decision_side;
+    amount_lamports: number;
+    ai_commitment: Buffer;
+  } {
+    const raw = this.decode_instruction_data(data_base58);
+    if (raw.length !== 57) {
+      throw new app_error("open ai duel instruction data length mismatch", 400);
+    }
+    const discriminator_raw = raw.subarray(0, 8);
+    if (!Buffer.from(discriminator_raw).equals(open_ai_duel_discriminator)) {
+      throw new app_error("unexpected instruction discriminator", 400);
+    }
+
+    const duel_id = Number(Buffer.from(raw.subarray(8, 16)).readBigUInt64LE(0));
+    if (!Number.isSafeInteger(duel_id)) {
+      throw new app_error("invalid duel id", 400);
+    }
+
+    const player_side = side_from_raw(raw[16]);
+    const amount_lamports = Number(Buffer.from(raw.subarray(17, 25)).readBigUInt64LE(0));
+    if (!Number.isSafeInteger(amount_lamports)) {
+      throw new app_error("invalid duel amount", 400);
+    }
+
+    const ai_commitment = Buffer.from(raw.subarray(25, 57));
+
+    return {
+      duel_id,
+      player_side,
+      amount_lamports,
+      ai_commitment
+    };
+  }
+
+  private decode_instruction_data(data_base58: string): Uint8Array {
+    try {
+      return bs58.decode(data_base58);
+    } catch {
+      throw new app_error("instruction data is not base58", 400);
+    }
+  }
+
+  private require_instruction_discriminator(
+    data_base58: string,
+    expected_discriminator: Buffer,
+    expected_length: number,
+    instruction_name: string
+  ): void {
+    const raw = this.decode_instruction_data(data_base58);
+    if (raw.length !== expected_length) {
+      throw new app_error(`${instruction_name} instruction data length mismatch`, 400);
+    }
+    const discriminator_raw = raw.subarray(0, 8);
+    if (!Buffer.from(discriminator_raw).equals(expected_discriminator)) {
+      throw new app_error(`unexpected ${instruction_name} discriminator`, 400);
+    }
+  }
+
+  private require_signer(parsed: any, expected_wallet: string, error_message: string): void {
+    const signer_present = parsed.transaction.message.accountKeys.some((key: any) => {
+      const key_pubkey =
+        typeof key?.pubkey === "string" ? key.pubkey : key?.pubkey?.toBase58?.();
+      return Boolean(key?.signer) && key_pubkey === expected_wallet;
+    });
+    if (!signer_present) {
+      throw new app_error(error_message, 400);
+    }
   }
 
   private decode_round_account(data_buffer: Buffer | Uint8Array): {
@@ -639,15 +1363,7 @@ export class chain_admin_service {
       ensure_available(1);
       const side_raw = data.readUInt8(offset);
       offset += 1;
-      if (side_raw === 0) {
-        winning_side = "yes";
-      } else if (side_raw === 1) {
-        winning_side = "no";
-      } else if (side_raw === 2) {
-        winning_side = "skip";
-      } else {
-        throw new app_error("invalid resolved side", 502);
-      }
+      winning_side = side_from_raw(side_raw);
     }
 
     return {
@@ -661,18 +1377,26 @@ export class chain_admin_service {
     };
   }
 
-  private async wait_for_round_owner(round_pda: PublicKey, expected_owner: PublicKey, timeout_ms: number): Promise<void> {
+  private async wait_for_account_owner(
+    account_key: PublicKey,
+    expected_owner: PublicKey,
+    timeout_ms: number
+  ): Promise<void> {
     const started_at = Date.now();
 
     while (Date.now() - started_at < timeout_ms) {
-      const account = await this.base_connection.getAccountInfo(round_pda, "confirmed");
+      const account = await this.base_connection.getAccountInfo(account_key, "confirmed");
       if (account && account.owner.equals(expected_owner)) {
         return;
       }
       await sleep(500);
     }
 
-    throw new app_error("timed out waiting for round ownership sync from ER to base layer", 504);
+    throw new app_error("timed out waiting for account ownership sync from ER to base layer", 504);
+  }
+
+  private to_public_key(value: PublicKey | string): PublicKey {
+    return value instanceof PublicKey ? value : new PublicKey(value);
   }
 
   private async send_base_transaction(instructions: TransactionInstruction[], operation_label: string): Promise<string> {

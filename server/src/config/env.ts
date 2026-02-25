@@ -15,6 +15,7 @@ const env_schema = z.object({
   MONGODB_URI: z.string().default("mongodb://127.0.0.1:27017"),
   MONGODB_DB_NAME: z.string().default("ubalance_prediction_market"),
   ROUND_RESOLVE_DELAY_SECONDS: z.coerce.number().default(20),
+  AI_DUEL_MAX_STAKE_LAMPORTS: z.coerce.number().int().positive().default(50_000_000),
   AUTH_CHALLENGE_TTL_SECONDS: z.coerce.number().default(300),
   AUTH_SESSION_TTL_SECONDS: z.coerce.number().default(86400)
 });

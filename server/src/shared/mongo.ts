@@ -59,6 +59,78 @@ export type round_action_document = {
   updated_at_ms: number;
 };
 
+export type match_document = {
+  _id: string;
+  id: string;
+  market_slug: string;
+  market_pda: string;
+  match_id: number;
+  match_pda: string;
+  buy_in_lamports: number;
+  max_players: number;
+  player_count: number;
+  pot_lamports: number;
+  winner_count: number;
+  highest_score: number;
+  start_at_ms: number;
+  end_at_ms: number;
+  status: "open" | "locked" | "resolved" | "cancelled";
+  create_tx_signature: string | null;
+  lock_tx_signature: string | null;
+  finalize_tx_signature: string | null;
+  cancel_tx_signature: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+
+export type match_entry_document = {
+  _id: string;
+  match_id: string;
+  match_pda: string;
+  wallet: string;
+  match_entry_pda: string;
+  buy_in_lamports: number;
+  score: number | null;
+  is_winner: boolean | null;
+  result_recorded: boolean;
+  joined: boolean;
+  claimed: boolean;
+  join_tx_signature: string | null;
+  claim_tx_signature: string | null;
+  joined_at_ms: number;
+  claimed_at_ms: number | null;
+  updated_at_ms: number;
+};
+
+export type ai_duel_document = {
+  _id: string;
+  id: string;
+  market_slug: string;
+  market_pda: string;
+  round_id: string;
+  round_number: number;
+  round_pda: string;
+  player_wallet: string;
+  duel_id: number;
+  ai_duel_pda: string;
+  house_bankroll_pda: string;
+  player_side: "yes" | "no" | "skip";
+  ai_side: "yes" | "no" | "skip";
+  ai_nonce_base64: string;
+  ai_commitment_base64: string;
+  amount_lamports: number;
+  status: "prepared" | "open" | "revealed" | "settled" | "cancelled";
+  outcome: "player_win" | "house_win" | "push" | null;
+  player_payout_lamports: number | null;
+  open_tx_signature: string | null;
+  reveal_tx_signature: string | null;
+  settle_tx_signature: string | null;
+  claim_tx_signature: string | null;
+  claimed_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+
 export type auth_challenge_document = {
   _id: string;
   wallet: string;
@@ -83,6 +155,9 @@ export class mongo_service {
   markets_collection!: Collection<market_document>;
   rounds_collection!: Collection<round_document>;
   round_actions_collection!: Collection<round_action_document>;
+  matches_collection!: Collection<match_document>;
+  match_entries_collection!: Collection<match_entry_document>;
+  ai_duels_collection!: Collection<ai_duel_document>;
   auth_challenges_collection!: Collection<auth_challenge_document>;
   auth_sessions_collection!: Collection<auth_session_document>;
   private init_promise: Promise<void> | null = null;
@@ -141,6 +216,9 @@ export class mongo_service {
     this.markets_collection = this.db.collection<market_document>("markets");
     this.rounds_collection = this.db.collection<round_document>("rounds");
     this.round_actions_collection = this.db.collection<round_action_document>("round_actions");
+    this.matches_collection = this.db.collection<match_document>("matches");
+    this.match_entries_collection = this.db.collection<match_entry_document>("match_entries");
+    this.ai_duels_collection = this.db.collection<ai_duel_document>("ai_duels");
     this.auth_challenges_collection = this.db.collection<auth_challenge_document>("auth_challenges");
     this.auth_sessions_collection = this.db.collection<auth_session_document>("auth_sessions");
     await this.ensure_indexes();
@@ -161,6 +239,47 @@ export class mongo_service {
 
     await this.round_actions_collection.createIndex({ round_id: 1, wallet: 1 }, { unique: true, name: "idx_actions_round_wallet_unique" });
     await this.round_actions_collection.createIndex({ round_id: 1 }, { name: "idx_actions_round" });
+
+    await this.matches_collection.createIndex({ id: 1 }, { unique: true, name: "idx_matches_id_unique" });
+    await this.matches_collection.createIndex(
+      { market_slug: 1, match_id: 1 },
+      { unique: true, name: "idx_matches_market_match_id_unique" }
+    );
+    await this.matches_collection.createIndex(
+      { market_slug: 1, status: 1, end_at_ms: 1 },
+      { name: "idx_matches_market_status_end" }
+    );
+    await this.matches_collection.createIndex(
+      { status: 1, end_at_ms: 1 },
+      { name: "idx_matches_status_end" }
+    );
+
+    await this.match_entries_collection.createIndex(
+      { match_id: 1, wallet: 1 },
+      { unique: true, name: "idx_match_entries_match_wallet_unique" }
+    );
+    await this.match_entries_collection.createIndex(
+      { match_id: 1 },
+      { name: "idx_match_entries_match" }
+    );
+    await this.match_entries_collection.createIndex(
+      { wallet: 1, claimed: 1 },
+      { name: "idx_match_entries_wallet_claimed" }
+    );
+
+    await this.ai_duels_collection.createIndex({ id: 1 }, { unique: true, name: "idx_ai_duels_id_unique" });
+    await this.ai_duels_collection.createIndex(
+      { market_slug: 1, player_wallet: 1, duel_id: 1 },
+      { unique: true, name: "idx_ai_duels_market_player_duel_unique" }
+    );
+    await this.ai_duels_collection.createIndex(
+      { round_id: 1, status: 1 },
+      { name: "idx_ai_duels_round_status" }
+    );
+    await this.ai_duels_collection.createIndex(
+      { player_wallet: 1, status: 1, created_at_ms: -1 },
+      { name: "idx_ai_duels_player_status_created" }
+    );
 
     await this.auth_challenges_collection.createIndex(
       { expires_at: 1 },

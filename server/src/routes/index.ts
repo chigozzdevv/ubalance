@@ -11,6 +11,12 @@ import { oracle_service } from "@/features/oracle/oracle.service";
 import { rounds_service } from "@/features/rounds/rounds.service";
 import { rounds_controller } from "@/features/rounds/rounds.controller";
 import { register_rounds_routes } from "@/features/rounds/rounds.routes";
+import { matches_service } from "@/features/matches/matches.service";
+import { matches_controller } from "@/features/matches/matches.controller";
+import { register_matches_routes } from "@/features/matches/matches.routes";
+import { ai_duels_service } from "@/features/ai-duels/ai-duels.service";
+import { ai_duels_controller } from "@/features/ai-duels/ai-duels.controller";
+import { register_ai_duels_routes } from "@/features/ai-duels/ai-duels.routes";
 import { er_service } from "@/features/er/er.service";
 import { er_controller } from "@/features/er/er.controller";
 import { register_er_routes } from "@/features/er/er.routes";
@@ -28,11 +34,23 @@ export const register_routes = async (fastify: FastifyInstance) => {
     oracle_service_instance,
     chain_admin_service_instance
   );
+  const matches_service_instance = new matches_service(
+    mongo_service_instance,
+    markets_service_instance,
+    chain_admin_service_instance
+  );
+  const ai_duels_service_instance = new ai_duels_service(
+    mongo_service_instance,
+    markets_service_instance,
+    chain_admin_service_instance
+  );
   const er_service_instance = new er_service();
 
   const auth_controller_instance = new auth_controller(auth_service_instance);
   const markets_controller_instance = new markets_controller(markets_service_instance);
   const rounds_controller_instance = new rounds_controller(rounds_service_instance);
+  const matches_controller_instance = new matches_controller(matches_service_instance);
+  const ai_duels_controller_instance = new ai_duels_controller(ai_duels_service_instance);
   const er_controller_instance = new er_controller(er_service_instance);
 
   const require_auth = build_auth_guard(auth_service_instance);
@@ -48,6 +66,14 @@ export const register_routes = async (fastify: FastifyInstance) => {
   await fastify.register(async (round_scope) => {
     await register_rounds_routes(round_scope, rounds_controller_instance, require_auth);
   }, { prefix: "/rounds" });
+
+  await fastify.register(async (match_scope) => {
+    await register_matches_routes(match_scope, matches_controller_instance, require_auth);
+  }, { prefix: "/matches" });
+
+  await fastify.register(async (ai_duel_scope) => {
+    await register_ai_duels_routes(ai_duel_scope, ai_duels_controller_instance, require_auth);
+  }, { prefix: "/ai-duels" });
 
   await fastify.register(async (er_scope) => {
     await register_er_routes(er_scope, er_controller_instance);

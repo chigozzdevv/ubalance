@@ -8,7 +8,7 @@ Main characteristics:
 
 - Swipe-first frontend for `yes / no / skip` decisions.
 - Fastify backend that manages auth, market seeding, round lifecycle, and relay transaction preparation.
-- Anchor program for market/round state transitions.
+- Anchor program for rounds, PvP matches, and PvAI duels.
 - MongoDB persistence for market metadata, round snapshots, and user action aggregates.
 - Pyth Hermes price feeds for reference and settlement prices.
 
@@ -70,10 +70,10 @@ MagicBlock is used for round-account delegation and ER transaction execution.
 Where this happens:
 
 - Delegation program IDs and helpers: `@magicblock-labs/ephemeral-rollups-sdk`.
-- Delegating round PDA: `chain_admin_service.delegate_round_account`.
+- Delegating PDAs: `chain_admin_service.delegate_account` / `delegate_round_account`.
 - Submitting ER tx: `chain_admin_service.send_er_transaction`.
-- Committing ER state back to base: `commit_and_undelegate_round`.
-- Ownership sync check: waits until round account owner is back to program ID on base layer.
+- Committing ER state back to base: `commit_and_undelegate_round` and `commit_and_undelegate_account`.
+- Ownership sync check: waits until PDA owner is back to program ID on base layer.
 
 ### Delegation lifecycle snippet
 
@@ -103,17 +103,23 @@ Core instructions:
 - `set_market_active`
 - `open_round`
 - `place_prediction`
+- `claim_payout`
 - `lock_round`
 - `resolve_round`
+- `create_match`, `join_match`, `lock_match`, `set_match_entry_result`, `finalize_match`, `cancel_match`, `claim_match_payout`
+- `init_house_bankroll`, `set_house_bankroll_active`, `fund_house_bankroll`, `withdraw_house_bankroll`
+- `open_ai_duel`, `reveal_ai_duel`, `settle_ai_duel`, `claim_ai_duel_payout`
 - `delegate_pda`
 - `commit_round`
 - `commit_and_undelegate_round`
+- `commit_and_undelegate_pda`
 
 Important behavior:
 
-- `place_prediction` currently updates aggregate totals on `Round`.
-- It does not transfer escrow funds in this version.
-- Winning side is derived from settlement vs reference price.
+- `place_prediction` transfers user lamports into the round account for `yes/no`.
+- `claim_payout` pays winners pro-rata from the pooled `yes/no` stake.
+- PvP ties split the match pot across top-score winners.
+- PvAI uses commit-reveal for AI side selection before settlement.
 
 ## API Overview
 
@@ -143,6 +149,33 @@ Protected round action routes:
 
 - `POST /rounds/:roundId/actions/relay-prepare` (Bearer token)
 - `POST /rounds/:roundId/actions` (Bearer token)
+- `POST /rounds/:roundId/claims/relay-prepare` (Bearer token)
+
+Protected PvP routes:
+
+- `GET /matches`
+- `GET /matches/:matchId`
+- `POST /matches` (admin wallet)
+- `POST /matches/:matchId/join/relay-prepare`
+- `POST /matches/:matchId/join`
+- `POST /matches/:matchId/finalize` (admin wallet)
+- `POST /matches/:matchId/cancel` (admin wallet)
+- `POST /matches/:matchId/claims/relay-prepare`
+- `POST /matches/:matchId/claims`
+
+Protected PvAI routes:
+
+- `GET /ai-duels`
+- `GET /ai-duels/:duelId`
+- `POST /ai-duels/house/ensure` (admin wallet)
+- `POST /ai-duels/house/fund` (admin wallet)
+- `POST /ai-duels/house/withdraw` (admin wallet)
+- `POST /ai-duels/house/active` (admin wallet)
+- `POST /ai-duels/open/relay-prepare`
+- `POST /ai-duels/:duelId/open`
+- `POST /ai-duels/:duelId/reveal-settle` (admin wallet)
+- `POST /ai-duels/:duelId/claims/relay-prepare`
+- `POST /ai-duels/:duelId/claims`
 
 ## Snippets
 
@@ -187,6 +220,8 @@ curl http://localhost:3001/api/v1/rounds/active
 │   ├── src/features/auth/            # Wallet challenge/session auth
 │   ├── src/features/markets/         # Market seed + chain sync
 │   ├── src/features/rounds/          # Round lifecycle + action recording
+│   ├── src/features/matches/         # PvP match lifecycle
+│   ├── src/features/ai-duels/        # PvAI duel lifecycle + bankroll
 │   ├── src/features/chain/           # Solana + MagicBlock transaction logic
 │   ├── src/features/oracle/          # Pyth Hermes integration
 │   ├── src/features/er/              # ER config/validator endpoints
@@ -234,6 +269,7 @@ ER_VALIDATOR_PUBKEY=MUS3hc9TCw4cGC12vHNoYcCGzJG1txjgQLZWVoeNHNd
 MONGODB_URI=mongodb://127.0.0.1:27017
 MONGODB_DB_NAME=ubalance_prediction_market
 ROUND_RESOLVE_DELAY_SECONDS=20
+AI_DUEL_MAX_STAKE_LAMPORTS=50000000
 AUTH_CHALLENGE_TTL_SECONDS=300
 AUTH_SESSION_TTL_SECONDS=86400
 ```

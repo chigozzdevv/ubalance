@@ -12,13 +12,21 @@ import {
 const market_seed = Buffer.from("market");
 const round_seed = Buffer.from("round");
 const position_seed = Buffer.from("position");
+const match_seed = Buffer.from("match");
+const match_entry_seed = Buffer.from("match_entry");
+const house_bankroll_seed = Buffer.from("house_bankroll");
+const ai_duel_seed = Buffer.from("ai_duel");
 
 export type decision_side = "yes" | "no" | "skip";
 
 export type account_type =
   | { kind: "market"; admin: PublicKey; market_index: number }
   | { kind: "round"; market: PublicKey; round_number: number }
-  | { kind: "position"; round: PublicKey; user: PublicKey };
+  | { kind: "position"; round: PublicKey; user: PublicKey }
+  | { kind: "match"; market: PublicKey; match_id: number }
+  | { kind: "match_entry"; match_account: PublicKey; player: PublicKey }
+  | { kind: "house_bankroll"; admin: PublicKey }
+  | { kind: "ai_duel"; market: PublicKey; player: PublicKey; duel_id: number };
 
 const encode_u8 = (value: number): Buffer => Buffer.from([value & 0xff]);
 
@@ -72,7 +80,25 @@ const encode_account_type = (account: account_type): Buffer => {
   if (account.kind === "round") {
     return Buffer.concat([encode_u8(1), account.market.toBuffer(), encode_u64(account.round_number)]);
   }
-  return Buffer.concat([encode_u8(2), account.round.toBuffer(), account.user.toBuffer()]);
+  if (account.kind === "position") {
+    return Buffer.concat([encode_u8(2), account.round.toBuffer(), account.user.toBuffer()]);
+  }
+  if (account.kind === "match") {
+    return Buffer.concat([encode_u8(3), account.market.toBuffer(), encode_u64(account.match_id)]);
+  }
+  if (account.kind === "match_entry") {
+    return Buffer.concat([encode_u8(4), account.match_account.toBuffer(), account.player.toBuffer()]);
+  }
+  if (account.kind === "house_bankroll") {
+    return Buffer.concat([encode_u8(5), account.admin.toBuffer()]);
+  }
+
+  return Buffer.concat([
+    encode_u8(6),
+    account.market.toBuffer(),
+    account.player.toBuffer(),
+    encode_u64(account.duel_id)
+  ]);
 };
 
 export const derive_market_pda = (program_id: PublicKey, admin: PublicKey, market_index: number): PublicKey => {
@@ -85,6 +111,34 @@ export const derive_round_pda = (program_id: PublicKey, market_pda: PublicKey, r
 
 export const derive_position_pda = (program_id: PublicKey, round_pda: PublicKey, user: PublicKey): PublicKey => {
   return PublicKey.findProgramAddressSync([position_seed, round_pda.toBuffer(), user.toBuffer()], program_id)[0];
+};
+
+export const derive_match_pda = (program_id: PublicKey, market_pda: PublicKey, match_id: number): PublicKey => {
+  return PublicKey.findProgramAddressSync([match_seed, market_pda.toBuffer(), encode_u64(match_id)], program_id)[0];
+};
+
+export const derive_match_entry_pda = (
+  program_id: PublicKey,
+  match_pda: PublicKey,
+  player: PublicKey
+): PublicKey => {
+  return PublicKey.findProgramAddressSync([match_entry_seed, match_pda.toBuffer(), player.toBuffer()], program_id)[0];
+};
+
+export const derive_house_bankroll_pda = (program_id: PublicKey, admin: PublicKey): PublicKey => {
+  return PublicKey.findProgramAddressSync([house_bankroll_seed, admin.toBuffer()], program_id)[0];
+};
+
+export const derive_ai_duel_pda = (
+  program_id: PublicKey,
+  market_pda: PublicKey,
+  player: PublicKey,
+  duel_id: number
+): PublicKey => {
+  return PublicKey.findProgramAddressSync(
+    [ai_duel_seed, market_pda.toBuffer(), player.toBuffer(), encode_u64(duel_id)],
+    program_id
+  )[0];
 };
 
 export const create_initialize_market_instruction = (args: {
@@ -187,6 +241,349 @@ export const create_place_prediction_instruction = (args: {
   });
 };
 
+export const create_claim_payout_instruction = (args: {
+  program_id: PublicKey;
+  user: PublicKey;
+  market_pda: PublicKey;
+  round_pda: PublicKey;
+  position_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.user, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.round_pda, isWritable: true, isSigner: false },
+      { pubkey: args.position_pda, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("claim_payout")
+  });
+};
+
+export const create_create_match_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  market_pda: PublicKey;
+  match_pda: PublicKey;
+  match_id: number;
+  buy_in_lamports: number;
+  max_players: number;
+  start_at_ts: number;
+  end_at_ts: number;
+}): TransactionInstruction => {
+  const data = Buffer.concat([
+    instruction_discriminator("create_match"),
+    encode_u64(args.match_id),
+    encode_u64(args.buy_in_lamports),
+    encode_u8(args.max_players),
+    encode_i64(args.start_at_ts),
+    encode_i64(args.end_at_ts)
+  ]);
+
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.match_pda, isWritable: true, isSigner: false },
+      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
+    ],
+    data
+  });
+};
+
+export const create_join_match_instruction = (args: {
+  program_id: PublicKey;
+  player: PublicKey;
+  match_pda: PublicKey;
+  match_entry_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.player, isWritable: true, isSigner: true },
+      { pubkey: args.match_pda, isWritable: true, isSigner: false },
+      { pubkey: args.match_entry_pda, isWritable: true, isSigner: false },
+      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
+    ],
+    data: instruction_discriminator("join_match")
+  });
+};
+
+export const create_lock_match_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  market_pda: PublicKey;
+  match_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.match_pda, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("lock_match")
+  });
+};
+
+export const create_set_match_entry_result_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  market_pda: PublicKey;
+  match_pda: PublicKey;
+  match_entry_pda: PublicKey;
+  score: number;
+  is_winner: boolean;
+}): TransactionInstruction => {
+  const data = Buffer.concat([
+    instruction_discriminator("set_match_entry_result"),
+    encode_u16(args.score),
+    encode_u8(args.is_winner ? 1 : 0)
+  ]);
+
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.match_pda, isWritable: true, isSigner: false },
+      { pubkey: args.match_entry_pda, isWritable: true, isSigner: false }
+    ],
+    data
+  });
+};
+
+export const create_finalize_match_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  market_pda: PublicKey;
+  match_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.match_pda, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("finalize_match")
+  });
+};
+
+export const create_cancel_match_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  market_pda: PublicKey;
+  match_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.match_pda, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("cancel_match")
+  });
+};
+
+export const create_claim_match_payout_instruction = (args: {
+  program_id: PublicKey;
+  player: PublicKey;
+  match_pda: PublicKey;
+  match_entry_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.player, isWritable: true, isSigner: true },
+      { pubkey: args.match_pda, isWritable: true, isSigner: false },
+      { pubkey: args.match_entry_pda, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("claim_match_payout")
+  });
+};
+
+export const create_init_house_bankroll_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  house_bankroll_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.house_bankroll_pda, isWritable: true, isSigner: false },
+      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
+    ],
+    data: instruction_discriminator("init_house_bankroll")
+  });
+};
+
+export const create_set_house_bankroll_active_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  house_bankroll_pda: PublicKey;
+  active: boolean;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.house_bankroll_pda, isWritable: true, isSigner: false }
+    ],
+    data: Buffer.concat([
+      instruction_discriminator("set_house_bankroll_active"),
+      encode_u8(args.active ? 1 : 0)
+    ])
+  });
+};
+
+export const create_fund_house_bankroll_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  house_bankroll_pda: PublicKey;
+  amount_lamports: number;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.house_bankroll_pda, isWritable: true, isSigner: false },
+      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
+    ],
+    data: Buffer.concat([
+      instruction_discriminator("fund_house_bankroll"),
+      encode_u64(args.amount_lamports)
+    ])
+  });
+};
+
+export const create_withdraw_house_bankroll_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  house_bankroll_pda: PublicKey;
+  amount_lamports: number;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.house_bankroll_pda, isWritable: true, isSigner: false }
+    ],
+    data: Buffer.concat([
+      instruction_discriminator("withdraw_house_bankroll"),
+      encode_u64(args.amount_lamports)
+    ])
+  });
+};
+
+export const create_open_ai_duel_instruction = (args: {
+  program_id: PublicKey;
+  player: PublicKey;
+  market_pda: PublicKey;
+  round_pda: PublicKey;
+  house_bankroll_pda: PublicKey;
+  ai_duel_pda: PublicKey;
+  duel_id: number;
+  player_side: decision_side;
+  amount_lamports: number;
+  ai_commitment: Uint8Array;
+}): TransactionInstruction => {
+  const commitment = Buffer.from(args.ai_commitment);
+  if (commitment.length !== 32) {
+    throw new Error("ai_commitment must be 32 bytes");
+  }
+
+  const data = Buffer.concat([
+    instruction_discriminator("open_ai_duel"),
+    encode_u64(args.duel_id),
+    encode_side(args.player_side),
+    encode_u64(args.amount_lamports),
+    commitment
+  ]);
+
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.player, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.round_pda, isWritable: false, isSigner: false },
+      { pubkey: args.house_bankroll_pda, isWritable: true, isSigner: false },
+      { pubkey: args.ai_duel_pda, isWritable: true, isSigner: false },
+      { pubkey: SystemProgram.programId, isWritable: false, isSigner: false }
+    ],
+    data
+  });
+};
+
+export const create_reveal_ai_duel_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  market_pda: PublicKey;
+  ai_duel_pda: PublicKey;
+  ai_side: decision_side;
+  nonce: Uint8Array;
+}): TransactionInstruction => {
+  const nonce = Buffer.from(args.nonce);
+  if (nonce.length !== 32) {
+    throw new Error("nonce must be 32 bytes");
+  }
+
+  const data = Buffer.concat([
+    instruction_discriminator("reveal_ai_duel"),
+    encode_side(args.ai_side),
+    nonce
+  ]);
+
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.ai_duel_pda, isWritable: true, isSigner: false }
+    ],
+    data
+  });
+};
+
+export const create_settle_ai_duel_instruction = (args: {
+  program_id: PublicKey;
+  admin: PublicKey;
+  market_pda: PublicKey;
+  round_pda: PublicKey;
+  house_bankroll_pda: PublicKey;
+  ai_duel_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.admin, isWritable: true, isSigner: true },
+      { pubkey: args.market_pda, isWritable: false, isSigner: false },
+      { pubkey: args.round_pda, isWritable: false, isSigner: false },
+      { pubkey: args.house_bankroll_pda, isWritable: true, isSigner: false },
+      { pubkey: args.ai_duel_pda, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("settle_ai_duel")
+  });
+};
+
+export const create_claim_ai_duel_payout_instruction = (args: {
+  program_id: PublicKey;
+  player: PublicKey;
+  ai_duel_pda: PublicKey;
+}): TransactionInstruction => {
+  return new TransactionInstruction({
+    programId: args.program_id,
+    keys: [
+      { pubkey: args.player, isWritable: true, isSigner: true },
+      { pubkey: args.ai_duel_pda, isWritable: true, isSigner: false }
+    ],
+    data: instruction_discriminator("claim_ai_duel_payout")
+  });
+};
+
 export const create_commit_and_undelegate_round_instruction = (args: {
   program_id: PublicKey;
   payer: PublicKey;
@@ -206,22 +603,24 @@ export const create_commit_and_undelegate_round_instruction = (args: {
   });
 };
 
-export const create_claim_payout_instruction = (args: {
+export const create_commit_and_undelegate_pda_instruction = (args: {
   program_id: PublicKey;
-  user: PublicKey;
-  market_pda: PublicKey;
-  round_pda: PublicKey;
-  position_pda: PublicKey;
+  payer: PublicKey;
+  pda: PublicKey;
+  account_type: account_type;
 }): TransactionInstruction => {
   return new TransactionInstruction({
     programId: args.program_id,
     keys: [
-      { pubkey: args.user, isWritable: true, isSigner: true },
-      { pubkey: args.market_pda, isWritable: false, isSigner: false },
-      { pubkey: args.round_pda, isWritable: true, isSigner: false },
-      { pubkey: args.position_pda, isWritable: true, isSigner: false }
+      { pubkey: args.payer, isWritable: true, isSigner: true },
+      { pubkey: args.pda, isWritable: true, isSigner: false },
+      { pubkey: MAGIC_PROGRAM_ID, isWritable: false, isSigner: false },
+      { pubkey: MAGIC_CONTEXT_ID, isWritable: true, isSigner: false }
     ],
-    data: instruction_discriminator("claim_payout")
+    data: Buffer.concat([
+      instruction_discriminator("commit_and_undelegate_pda"),
+      encode_account_type(args.account_type)
+    ])
   });
 };
 
