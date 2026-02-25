@@ -116,6 +116,9 @@ export type ai_duel_document = {
   house_bankroll_pda: string;
   player_side: "yes" | "no" | "skip";
   ai_side: "yes" | "no" | "skip";
+  ai_decision_model?: string | null;
+  ai_decision_confidence?: number | null;
+  ai_decision_rationale?: string | null;
   ai_nonce_base64: string;
   ai_commitment_base64: string;
   amount_lamports: number;

@@ -12,6 +12,7 @@ import type { chain_admin_service } from "@/features/chain/chain-admin.service";
 import type { decision_side } from "@/features/rounds/rounds.model";
 import type { ai_duel_outcome, ai_duel_status, ai_duel_view } from "@/features/ai-duels/ai-duels.model";
 import type { account_type } from "@/features/chain/ubalance-program";
+import type { ai_decision_service } from "@/features/ai-duels/ai-decision.service";
 
 const ai_duel_commit_domain = Buffer.from("ubalance-ai-duel", "utf8");
 const max_list_limit = 100;
@@ -20,7 +21,8 @@ export class ai_duels_service {
   constructor(
     private readonly mongo: mongo_service,
     private readonly markets_service: markets_service,
-    private readonly chain_admin: chain_admin_service
+    private readonly chain_admin: chain_admin_service,
+    private readonly ai_decision: ai_decision_service
   ) {}
 
   async list(input?: {
@@ -188,7 +190,24 @@ export class ai_duels_service {
     await this.ensure_round_delegated(market_item.market_index, round_number);
 
     const duel_id = await this.allocate_duel_id(market_item.slug, input.wallet);
-    const ai_side = this.random_ai_side();
+    const recent_resolved_rounds = await this.mongo.rounds_collection
+      .find({
+        market_slug: market_item.slug,
+        status: "resolved",
+        settlement_price: { $ne: null }
+      })
+      .sort({ close_at_ms: -1 })
+      .limit(20)
+      .toArray();
+
+    const ai_decision = await this.ai_decision.decide_side({
+      wallet: input.wallet,
+      market: market_item,
+      round: round_document,
+      recent_resolved_rounds
+    });
+
+    const ai_side = ai_decision.side;
     const nonce = randomBytes(32);
     const ai_commitment = this.build_ai_commitment({
       duel_id,
@@ -228,6 +247,9 @@ export class ai_duels_service {
           house_bankroll_pda: initialized.house_bankroll_pda,
           player_side: input.player_side,
           ai_side,
+          ai_decision_model: ai_decision.model,
+          ai_decision_confidence: ai_decision.confidence,
+          ai_decision_rationale: ai_decision.rationale,
           ai_nonce_base64: nonce.toString("base64"),
           ai_commitment_base64: Buffer.from(ai_commitment).toString("base64"),
           amount_lamports: input.amount_lamports,
@@ -346,6 +368,10 @@ export class ai_duels_service {
       player: new PublicKey(duel_document.player_wallet),
       duel_id: Number(duel_document.duel_id)
     });
+    await this.ensure_undelegated(duel_document.house_bankroll_pda, {
+      kind: "house_bankroll",
+      admin: this.chain_admin.get_admin_public_key()
+    });
 
     const ai_side = duel_document.ai_side;
     const nonce = Buffer.from(duel_document.ai_nonce_base64, "base64");
@@ -459,10 +485,6 @@ export class ai_duels_service {
     );
 
     return this.get_by_id(duel_document.id);
-  }
-
-  private random_ai_side(): decision_side {
-    return Math.random() < 0.5 ? "yes" : "no";
   }
 
   private build_ai_commitment(input: {
@@ -656,6 +678,13 @@ export class ai_duels_service {
       aiDuelPda: duel_document.ai_duel_pda,
       houseBankrollPda: duel_document.house_bankroll_pda,
       playerSide: duel_document.player_side,
+      aiSide: duel_document.ai_side,
+      aiDecisionModel: duel_document.ai_decision_model ?? null,
+      aiDecisionConfidence:
+        duel_document.ai_decision_confidence === undefined || duel_document.ai_decision_confidence === null
+          ? null
+          : Number(duel_document.ai_decision_confidence),
+      aiDecisionRationale: duel_document.ai_decision_rationale ?? null,
       amountLamports: Number(duel_document.amount_lamports),
       status: duel_document.status,
       outcome: duel_document.outcome,

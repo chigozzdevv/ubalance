@@ -17,6 +17,10 @@ export type ai_duel_view = {
   aiDuelPda: string;
   houseBankrollPda: string;
   playerSide: decision_side;
+  aiSide: decision_side;
+  aiDecisionModel: string | null;
+  aiDecisionConfidence: number | null;
+  aiDecisionRationale: string | null;
   amountLamports: number;
   status: ai_duel_status;
   outcome: ai_duel_outcome | null;

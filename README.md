@@ -119,7 +119,7 @@ Important behavior:
 - `place_prediction` transfers user lamports into the round account for `yes/no`.
 - `claim_payout` pays winners pro-rata from the pooled `yes/no` stake.
 - PvP ties split the match pot across top-score winners.
-- PvAI uses commit-reveal for AI side selection before settlement.
+- PvAI uses OpenAI-driven side selection from live market/round context and commit-reveal before settlement.
 
 ## API Overview
 
@@ -269,6 +269,16 @@ ER_VALIDATOR_PUBKEY=MUS3hc9TCw4cGC12vHNoYcCGzJG1txjgQLZWVoeNHNd
 MONGODB_URI=mongodb://127.0.0.1:27017
 MONGODB_DB_NAME=ubalance_prediction_market
 ROUND_RESOLVE_DELAY_SECONDS=20
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-5-mini
+# OPENAI_MODEL=gpt-5.2
+OPENAI_REASONING_EFFORT=low
+OPENAI_TEMPERATURE=0.1
+OPENAI_MAX_COMPLETION_TOKENS=220
+OPENAI_TIMEOUT_MS=12000
+AI_MODEL_MIN_CONFIDENCE=0.55
+AI_MODEL_DECISION_RETRIES=2
 AI_DUEL_MAX_STAKE_LAMPORTS=50000000
 AUTH_CHALLENGE_TTL_SECONDS=300
 AUTH_SESSION_TTL_SECONDS=86400

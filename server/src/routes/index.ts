@@ -15,6 +15,7 @@ import { matches_service } from "@/features/matches/matches.service";
 import { matches_controller } from "@/features/matches/matches.controller";
 import { register_matches_routes } from "@/features/matches/matches.routes";
 import { ai_duels_service } from "@/features/ai-duels/ai-duels.service";
+import { ai_decision_service } from "@/features/ai-duels/ai-decision.service";
 import { ai_duels_controller } from "@/features/ai-duels/ai-duels.controller";
 import { register_ai_duels_routes } from "@/features/ai-duels/ai-duels.routes";
 import { er_service } from "@/features/er/er.service";
@@ -34,6 +35,7 @@ export const register_routes = async (fastify: FastifyInstance) => {
     oracle_service_instance,
     chain_admin_service_instance
   );
+  const ai_decision_service_instance = new ai_decision_service(oracle_service_instance);
   const matches_service_instance = new matches_service(
     mongo_service_instance,
     markets_service_instance,
@@ -42,7 +44,8 @@ export const register_routes = async (fastify: FastifyInstance) => {
   const ai_duels_service_instance = new ai_duels_service(
     mongo_service_instance,
     markets_service_instance,
-    chain_admin_service_instance
+    chain_admin_service_instance,
+    ai_decision_service_instance
   );
   const er_service_instance = new er_service();
 
