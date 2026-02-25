@@ -8,12 +8,15 @@ import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { TopNav } from "@/components/layout/top-nav";
 
 import { SwipeCard } from "@/components/game/swipe-card";
+import { AiDuelGame } from "@/components/game/ai-duel-game";
+import { MatchLobby } from "@/components/game/match-lobby";
 import { auth_api } from "@/lib/auth.api";
 import { env } from "@/lib/env";
 import { markets_api } from "@/lib/markets.api";
 import { rounds_api } from "@/lib/rounds.api";
 import type { market } from "@/types/market";
 import type { decision_side, round_view } from "@/types/round";
+import type { game_mode_type } from "@/types/game-mode";
 
 const decode_base64 = (value: string): Uint8Array => {
   const raw = atob(value);
@@ -45,6 +48,7 @@ export const SingleGame = () => {
 
   const [skipped_round_ids, set_skipped_round_ids] = useState<Set<string>>(new Set());
 
+  const [game_mode, set_game_mode] = useState<game_mode_type>("classic");
   const [selected_timeframe, set_selected_timeframe] = useState<number | null>(null);
   const [search_query, set_search_query] = useState("");
   const [amount_sol, set_amount_sol] = useState(0.1);
@@ -314,6 +318,8 @@ export const SingleGame = () => {
         timeframes={available_timeframes}
         selected_timeframe={selected_timeframe}
         on_select_timeframe={set_selected_timeframe}
+        game_mode={game_mode}
+        on_game_mode_change={set_game_mode}
         history={selected_history}
         amount_sol={amount_sol}
         on_amount_change={set_amount_sol}
@@ -328,45 +334,64 @@ export const SingleGame = () => {
           <div className="flex flex-wrap items-center gap-3">
           </div>
 
-          {active_round ? (
-            <>
-              <div className="text-center text-xs font-bold uppercase tracking-widest text-[#9eaba4] mb-2">
-                round 1 of {active_queue.length}
-              </div>
-              <SwipeCard key={active_round.id} round={active_round} amount_sol={amount_sol} on_decision={submit_decision} disabled={submitting} />
+          {game_mode === "classic" && (
+            active_round ? (
+              <>
+                <div className="text-center text-xs font-bold uppercase tracking-widest text-[#9eaba4] mb-2">
+                  round 1 of {active_queue.length}
+                </div>
+                <SwipeCard key={active_round.id} round={active_round} amount_sol={amount_sol} on_decision={submit_decision} disabled={submitting} />
 
-              <div className="grid grid-cols-3 gap-4 mx-auto w-full max-w-[360px]">
-                <button
-                  type="button"
-                  className="flex h-16 w-full items-center justify-center rounded-2xl border-2 border-red-500/20 bg-[#111513] backdrop-blur-sm text-red-500 hover:border-red-500 hover:bg-red-500/10 hover:shadow-[0_0_15px_rgba(239,68,68,0.2)] hover:-translate-y-1 transition-all duration-300 disabled:opacity-50 disabled:pointer-events-none active:scale-95 group"
-                  onClick={() => void submit_decision("no")}
-                  disabled={submitting}
-                >
-                  <span className="text-2xl group-hover:scale-125 transition-transform duration-300 font-black">✕</span>
-                </button>
-                <button
-                  type="button"
-                  className="flex h-16 w-full items-center justify-center rounded-2xl border-2 border-[#9eaba4]/20 bg-[#111513] backdrop-blur-sm text-[#9eaba4] hover:border-[#9eaba4]/50 hover:bg-[#171b19] hover:-translate-y-1 transition-all duration-300 disabled:opacity-50 disabled:pointer-events-none active:scale-95 group"
-                  onClick={() => void submit_decision("skip")}
-                  disabled={submitting}
-                >
-                  <span className="text-xl font-black uppercase tracking-widest text-[10px] group-hover:scale-110 transition-transform duration-300">skip</span>
-                </button>
-                <button
-                  type="button"
-                  className="flex h-16 w-full items-center justify-center rounded-2xl border-2 border-[#b9f6c9]/20 bg-[#111513] backdrop-blur-sm text-[#89eeb0] hover:border-[#89eeb0] hover:bg-[#b9f6c9]/10 hover:shadow-[0_0_15px_rgba(185,246,201,0.2)] hover:-translate-y-1 transition-all duration-300 disabled:opacity-50 disabled:pointer-events-none active:scale-95 group"
-                  onClick={() => void submit_decision("yes")}
-                  disabled={submitting}
-                >
-                  <span className="text-2xl group-hover:scale-125 transition-transform duration-300 mt-1">❤️</span>
-                </button>
+                <div className="grid grid-cols-3 gap-4 mx-auto w-full max-w-[360px]">
+                  <button
+                    type="button"
+                    className="flex h-16 w-full items-center justify-center rounded-2xl border-2 border-red-500/20 bg-[#111513] backdrop-blur-sm text-red-500 hover:border-red-500 hover:bg-red-500/10 hover:shadow-[0_0_15px_rgba(239,68,68,0.2)] hover:-translate-y-1 transition-all duration-300 disabled:opacity-50 disabled:pointer-events-none active:scale-95 group"
+                    onClick={() => void submit_decision("no")}
+                    disabled={submitting}
+                  >
+                    <span className="text-2xl group-hover:scale-125 transition-transform duration-300 font-black">✕</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="flex h-16 w-full items-center justify-center rounded-2xl border-2 border-[#9eaba4]/20 bg-[#111513] backdrop-blur-sm text-[#9eaba4] hover:border-[#9eaba4]/50 hover:bg-[#171b19] hover:-translate-y-1 transition-all duration-300 disabled:opacity-50 disabled:pointer-events-none active:scale-95 group"
+                    onClick={() => void submit_decision("skip")}
+                    disabled={submitting}
+                  >
+                    <span className="text-xl font-black uppercase tracking-widest text-[10px] group-hover:scale-110 transition-transform duration-300">skip</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="flex h-16 w-full items-center justify-center rounded-2xl border-2 border-[#b9f6c9]/20 bg-[#111513] backdrop-blur-sm text-[#89eeb0] hover:border-[#89eeb0] hover:bg-[#b9f6c9]/10 hover:shadow-[0_0_15px_rgba(185,246,201,0.2)] hover:-translate-y-1 transition-all duration-300 disabled:opacity-50 disabled:pointer-events-none active:scale-95 group"
+                    onClick={() => void submit_decision("yes")}
+                    disabled={submitting}
+                  >
+                    <span className="text-2xl group-hover:scale-125 transition-transform duration-300 mt-1">❤️</span>
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="grid min-h-[420px] w-full max-w-[360px] mx-auto place-items-center rounded-[2rem] border border-dashed border-[#1e2422] bg-[#111513] text-[#9eaba4] font-medium tracking-wide text-center px-6">
+                <p>no active rounds matching your timeframe</p>
               </div>
+            )
+          )}
 
-            </>
-          ) : (
-            <div className="grid min-h-[420px] w-full max-w-[360px] mx-auto place-items-center rounded-[2rem] border border-dashed border-[#1e2422] bg-[#111513] text-[#9eaba4] font-medium tracking-wide text-center px-6">
-              <p>no active rounds matching your timeframe</p>
-            </div>
+          {game_mode === "ai_duel" && (
+            <AiDuelGame
+              markets={markets}
+              rounds={rounds}
+              selected_timeframe={selected_timeframe}
+              amount_sol={amount_sol}
+            />
+          )}
+
+          {game_mode === "pvp_match" && (
+            <MatchLobby
+              markets={markets}
+              rounds={rounds}
+              selected_timeframe={selected_timeframe}
+              amount_sol={amount_sol}
+            />
           )}
         </section>
       </main>

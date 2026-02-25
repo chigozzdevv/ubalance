@@ -29,7 +29,7 @@ On server boot:
 3. Ensure at least one `predicting` round exists per market.
 4. Delegate round PDAs to MagicBlock ER when needed.
 
-Bootstrap is triggered in background in `server/src/routes/index.ts`.
+Bootstrap is triggered in background in `server/src/routes/index.ts`, and `rounds_service` starts a continuous lifecycle tick worker (`ROUND_LIFECYCLE_TICK_MS`) after bootstrap.
 
 ### 2) Round lifecycle
 
@@ -119,8 +119,10 @@ Important behavior:
 
 - `place_prediction` transfers user lamports into the round account for `yes/no`.
 - `claim_payout` pays winners pro-rata from pooled `yes/no` stake after a 2.5% protocol fee.
-- PvP `set_match_entry_result` computes scores on-chain from provided `(round, position)` account pairs; no score or winner flag is passed in instruction data.
+- PvP finalize now derives scoring round sets from all on-chain rounds in the match window, and blocks finalize until every in-window round is resolved; `set_match_entry_result` then computes scores on-chain from provided `(round, position)` pairs.
 - PvP match payouts are split from pot after a 2.5% protocol fee.
+- PvP creation is available to authenticated players; backend enforces a per-creator open-match cap.
+- PvP supports server-side `public` and `private` match access modes; private mode stores only salted join-code hashes and enforces join authorization at relay prepare/confirm routes.
 - `resolve_round` reads settlement directly from oracle update account + market feed config, and can be triggered permissionlessly.
 - PvAI supports turn chaining (`human -> AI -> human -> AI`) until round close by appending turns to a single duel.
 - PvAI settlement verifies commit-reveal for every recorded turn in a single settle transaction after round resolution.
@@ -155,11 +157,11 @@ Protected round action routes:
 - `POST /rounds/:roundId/actions` (Bearer token)
 - `POST /rounds/:roundId/claims/relay-prepare` (Bearer token)
 
-Protected PvP routes:
+PvP routes:
 
-- `GET /matches`
-- `GET /matches/:matchId`
-- `POST /matches` (admin wallet)
+- `GET /matches` (public)
+- `GET /matches/:matchId` (public)
+- `POST /matches` (authenticated wallet; creator)
 - `POST /matches/:matchId/join/relay-prepare`
 - `POST /matches/:matchId/join`
 - `POST /matches/:matchId/finalize` (admin wallet)
@@ -179,7 +181,7 @@ Protected PvAI routes:
 - `POST /ai-duels/:duelId/open`
 - `POST /ai-duels/:duelId/turns/relay-prepare`
 - `POST /ai-duels/:duelId/turns`
-- `POST /ai-duels/:duelId/reveal-settle` (admin wallet)
+- `POST /ai-duels/:duelId/reveal-settle` (player wallet for that duel, admin wallet also allowed)
 - `POST /ai-duels/:duelId/claims/relay-prepare`
 - `POST /ai-duels/:duelId/claims`
 
@@ -274,7 +276,9 @@ UBALANCE_ADMIN_SECRET_KEY=REPLACE_WITH_YOUR_SECRET_KEY
 ER_VALIDATOR_PUBKEY=MUS3hc9TCw4cGC12vHNoYcCGzJG1txjgQLZWVoeNHNd
 MONGODB_URI=mongodb://127.0.0.1:27017
 MONGODB_DB_NAME=ubalance_prediction_market
+MATCH_JOIN_CODE_PEPPER=
 ROUND_RESOLVE_DELAY_SECONDS=20
+ROUND_LIFECYCLE_TICK_MS=2500
 OPENAI_API_KEY=
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-5-mini

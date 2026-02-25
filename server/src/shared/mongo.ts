@@ -62,6 +62,10 @@ export type round_action_document = {
 export type match_document = {
   _id: string;
   id: string;
+  created_by_wallet?: string | null;
+  access_mode?: "public" | "private";
+  private_join_code_hash?: string | null;
+  private_join_code_salt?: string | null;
   market_slug: string;
   market_pda: string;
   match_id: number;
@@ -273,6 +277,14 @@ export class mongo_service {
     await this.matches_collection.createIndex(
       { status: 1, end_at_ms: 1 },
       { name: "idx_matches_status_end" }
+    );
+    await this.matches_collection.createIndex(
+      { created_by_wallet: 1, status: 1, created_at_ms: -1 },
+      { name: "idx_matches_creator_status_created" }
+    );
+    await this.matches_collection.createIndex(
+      { access_mode: 1, status: 1, end_at_ms: 1 },
+      { name: "idx_matches_access_status_end" }
     );
 
     await this.match_entries_collection.createIndex(

@@ -5,12 +5,15 @@ import { ConnectWalletButton } from "@/components/wallet/connect-wallet-button";
 
 import { useState, useRef, useEffect } from "react";
 import type { round_view } from "@/types/round";
+import type { game_mode_type } from "@/types/game-mode";
 import { format_price } from "@/lib/format";
 
 type top_nav_props = {
   timeframes: number[];
   selected_timeframe: number | null;
   on_select_timeframe: (timeframe: number | null) => void;
+  game_mode: game_mode_type;
+  on_game_mode_change: (mode: game_mode_type) => void;
   history: round_view[];
   amount_sol: number;
   on_amount_change: (value: number) => void;
@@ -22,6 +25,8 @@ export const TopNav = ({
   timeframes,
   selected_timeframe,
   on_select_timeframe,
+  game_mode,
+  on_game_mode_change,
   history,
   amount_sol,
   on_amount_change,
@@ -59,11 +64,29 @@ export const TopNav = ({
         </div>
 
         <div className="flex w-full flex-col gap-3 md:max-w-xl md:flex-row items-center justify-end">
-          <div className="flex items-center gap-2 flex-1 md:flex-none">
-            <span className="text-sm font-bold text-[#e7efe9] whitespace-nowrap">
-              Markets:
-            </span>
-            <div className="relative flex items-center bg-[#111513] border border-[#1e2422] rounded-xl pl-4 pr-3 h-11 transition duration-200 focus-within:border-[#89eeb0] focus-within:ring-1 focus-within:ring-[#89eeb0] w-full md:w-auto">
+          <div className="flex items-center gap-2 flex-col sm:flex-row w-full md:w-auto flex-1 md:flex-none">
+            {/* Game Mode Selector */}
+            <div className="relative flex items-center bg-[#111513] border border-[#1e2422] rounded-xl pl-4 pr-3 h-11 transition duration-200 focus-within:border-[#89eeb0] focus-within:ring-1 focus-within:ring-[#89eeb0] w-full sm:w-auto">
+              <select
+                value={game_mode}
+                onChange={(event) => on_game_mode_change(event.target.value as any)}
+                className="bg-transparent text-sm font-bold text-[#b9f6c9] outline-none focus:outline-none appearance-none cursor-pointer pr-5 w-full sm:w-auto"
+              >
+                <option value="classic">Classic</option>
+                <option value="ai_duel">PvAI Duel</option>
+                <option value="pvp_match">PvP Match</option>
+              </select>
+              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-[#9eaba4]">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </div>
+            </div>
+
+            <div className="relative flex items-center bg-[#111513] border border-[#1e2422] rounded-xl pl-3 pr-3 h-11 transition duration-200 focus-within:border-[#89eeb0] focus-within:ring-1 focus-within:ring-[#89eeb0] w-full sm:w-auto">
+              <span className="text-xs font-bold text-[#9eaba4] mr-2 whitespace-nowrap hidden sm:inline">
+                Time:
+              </span>
               <select
                 value={selected_timeframe === null ? "" : selected_timeframe.toString()}
                 onChange={(event) => {
@@ -71,7 +94,7 @@ export const TopNav = ({
                   on_select_timeframe(val === "" ? null : Number(val));
                 }}
                 disabled={timeframes.length === 0}
-                className="bg-transparent text-sm font-semibold text-[#e7efe9] outline-none focus:outline-none appearance-none cursor-pointer pr-5 w-auto"
+                className="bg-transparent text-sm font-semibold text-[#e7efe9] outline-none focus:outline-none appearance-none cursor-pointer pr-5 w-full sm:w-auto"
               >
                 {timeframes.length === 0 ? <option value="">none</option> : null}
                 <option value="">all</option>

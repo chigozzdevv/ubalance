@@ -15,11 +15,18 @@ const create_match_schema = z.object({
   buyInLamports: z.coerce.number().int().positive(),
   maxPlayers: z.coerce.number().int().min(2).max(100),
   startAtMs: z.coerce.number().int().positive(),
-  endAtMs: z.coerce.number().int().positive()
+  endAtMs: z.coerce.number().int().positive(),
+  accessMode: z.enum(["public", "private"]).optional().default("public"),
+  joinCode: z.string().trim().min(4).max(64).optional()
 });
 
 const confirm_tx_schema = z.object({
-  txSignature: z.string().min(20).max(128)
+  txSignature: z.string().min(20).max(128),
+  joinCode: z.string().trim().min(4).max(64).optional()
+});
+
+const join_prepare_schema = z.object({
+  joinCode: z.string().trim().min(4).max(64).optional()
 });
 
 export class matches_controller {
@@ -58,12 +65,14 @@ export class matches_controller {
 
       const payload = create_match_schema.parse(request.body ?? {});
       const created = await this.service.create_match({
-        admin_wallet: wallet,
+        creator_wallet: wallet,
         market_slug: payload.marketSlug,
         buy_in_lamports: payload.buyInLamports,
         max_players: payload.maxPlayers,
         start_at_ms: payload.startAtMs,
-        end_at_ms: payload.endAtMs
+        end_at_ms: payload.endAtMs,
+        access_mode: payload.accessMode,
+        join_code: payload.joinCode
       });
       reply.send(ok(created));
     } catch (error: unknown) {
@@ -80,9 +89,11 @@ export class matches_controller {
       }
 
       const match_id = (request.params as any).matchId as string;
+      const payload = join_prepare_schema.parse(request.body ?? {});
       const prepared = await this.service.prepare_join_relay({
         match_id,
-        wallet
+        wallet,
+        join_code: payload.joinCode
       });
 
       reply.send(ok({
@@ -111,7 +122,8 @@ export class matches_controller {
       const updated = await this.service.confirm_join({
         match_id,
         wallet,
-        tx_signature: payload.txSignature
+        tx_signature: payload.txSignature,
+        join_code: payload.joinCode
       });
 
       reply.send(ok(updated));

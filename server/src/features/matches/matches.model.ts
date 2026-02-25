@@ -1,6 +1,7 @@
 import type { market } from "@/features/markets/markets.model";
 
 export type match_status = "open" | "locked" | "resolved" | "cancelled";
+export type match_access_mode = "public" | "private";
 
 export type match_entry_view = {
   wallet: string;
@@ -17,6 +18,9 @@ export type match_entry_view = {
 
 export type match_view = {
   id: string;
+  createdByWallet: string | null;
+  accessMode: match_access_mode;
+  requiresJoinCode: boolean;
   market: market;
   marketPda: string;
   matchId: number;

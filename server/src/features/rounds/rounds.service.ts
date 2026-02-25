@@ -19,6 +19,7 @@ const delegation_scan_batch_size = 6;
 export class rounds_service {
   private refresh_in_progress: Promise<void> | null = null;
   private last_refresh_started_at_ms = 0;
+  private lifecycle_timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly mongo: mongo_service,
@@ -30,6 +31,7 @@ export class rounds_service {
   async bootstrap(): Promise<void> {
     await this.mongo.ensure_ready();
     await this.refresh_round_states();
+    this.start_lifecycle_worker();
   }
 
   async list_active(): Promise<round_view[]> {
@@ -285,6 +287,18 @@ export class rounds_service {
     });
 
     await this.refresh_in_progress;
+  }
+
+  private start_lifecycle_worker(): void {
+    if (this.lifecycle_timer) {
+      return;
+    }
+
+    const tick_ms = Math.max(1_000, Number(env.ROUND_LIFECYCLE_TICK_MS || 0));
+    this.lifecycle_timer = setInterval(() => {
+      this.schedule_refresh();
+    }, tick_ms);
+    this.lifecycle_timer.unref();
   }
 
   private schedule_refresh(): void {

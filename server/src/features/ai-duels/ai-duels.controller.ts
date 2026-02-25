@@ -275,7 +275,7 @@ export class ai_duels_controller {
       const duel_id = (request.params as any).duelId as string;
       const updated = await this.service.reveal_and_settle({
         duel_record_id: duel_id,
-        admin_wallet: wallet
+        wallet
       });
 
       reply.send(ok(updated));

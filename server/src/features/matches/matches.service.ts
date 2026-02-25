@@ -1,3 +1,5 @@
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { env } from "@/config/env";
 import { app_error } from "@/shared/app-error";
 import type {
   match_document,
@@ -10,11 +12,16 @@ import type { chain_admin_service } from "@/features/chain/chain-admin.service";
 import { PublicKey } from "@solana/web3.js";
 import type { account_type } from "@/features/chain/ubalance-program";
 import type {
+  match_access_mode,
   match_status,
   match_view
 } from "@/features/matches/matches.model";
 
 const max_list_limit = 100;
+const max_match_scoring_rounds = 256;
+const max_open_matches_per_creator = 5;
+const min_private_join_code_length = 4;
+const max_private_join_code_length = 64;
 
 export class matches_service {
   constructor(
@@ -61,15 +68,19 @@ export class matches_service {
   }
 
   async create_match(input: {
-    admin_wallet: string;
+    creator_wallet: string;
     market_slug: string;
     buy_in_lamports: number;
     max_players: number;
     start_at_ms: number;
     end_at_ms: number;
+    access_mode?: match_access_mode;
+    join_code?: string;
   }): Promise<match_view> {
     await this.mongo.ensure_ready();
-    this.require_admin_wallet(input.admin_wallet);
+    if (!input.creator_wallet || input.creator_wallet.length < 32) {
+      throw new app_error("invalid creator wallet", 400);
+    }
 
     const market_item = await this.get_market_or_throw(input.market_slug);
     if (!market_item.active) {
@@ -84,11 +95,44 @@ export class matches_service {
     if (!Number.isFinite(input.start_at_ms) || !Number.isFinite(input.end_at_ms)) {
       throw new app_error("startAtMs and endAtMs are required", 400);
     }
+    const access_mode = input.access_mode ?? "public";
+    if (access_mode !== "public" && access_mode !== "private") {
+      throw new app_error("accessMode must be public or private", 400);
+    }
+    const normalized_join_code = this.normalize_join_code(input.join_code);
+    if (access_mode === "private" && !normalized_join_code) {
+      throw new app_error("joinCode is required for private matches", 400);
+    }
+    if (access_mode === "public" && normalized_join_code) {
+      throw new app_error("joinCode can only be set for private matches", 400);
+    }
     if (input.end_at_ms <= input.start_at_ms) {
       throw new app_error("endAtMs must be greater than startAtMs", 400);
     }
     if (input.end_at_ms <= Date.now()) {
       throw new app_error("endAtMs must be in the future", 400);
+    }
+    const timeframe_ms = Number(market_item.timeframe_minutes) * 60_000;
+    if (!Number.isFinite(timeframe_ms) || timeframe_ms <= 0) {
+      throw new app_error("market timeframe is invalid", 409);
+    }
+    const duration_ms = input.end_at_ms - input.start_at_ms;
+    const worst_case_scoring_round_count = Math.ceil(duration_ms / timeframe_ms) + 2;
+    if (worst_case_scoring_round_count > max_match_scoring_rounds) {
+      throw new app_error(
+        `match duration is too long for scoring window cap (${max_match_scoring_rounds} rounds max)`,
+        400
+      );
+    }
+    const creator_open_match_count = await this.mongo.matches_collection.countDocuments({
+      created_by_wallet: input.creator_wallet,
+      status: { $in: ["open", "locked"] }
+    });
+    if (creator_open_match_count >= max_open_matches_per_creator) {
+      throw new app_error(
+        `open match limit reached (${max_open_matches_per_creator})`,
+        409
+      );
     }
 
     const match_id_numeric = await this.allocate_match_id(input.market_slug);
@@ -110,11 +154,18 @@ export class matches_service {
 
     const now = Date.now();
     const id = `${input.market_slug}-${match_id_numeric}`;
+    const private_join_code_secret =
+      access_mode === "private" && normalized_join_code
+        ? this.build_private_join_code_secret(normalized_join_code)
+        : null;
 
     await this.mongo.matches_collection.insertOne({
       _id: id,
       id,
       market_slug: input.market_slug,
+      access_mode,
+      private_join_code_hash: private_join_code_secret?.hash_hex ?? null,
+      private_join_code_salt: private_join_code_secret?.salt_hex ?? null,
       market_pda: market_item.market_pda,
       match_id: match_id_numeric,
       match_pda,
@@ -124,6 +175,7 @@ export class matches_service {
       pot_lamports: 0,
       winner_count: 0,
       highest_score: 0,
+      created_by_wallet: input.creator_wallet,
       start_at_ms: input.start_at_ms,
       end_at_ms: input.end_at_ms,
       status: "open",
@@ -141,6 +193,7 @@ export class matches_service {
   async prepare_join_relay(input: {
     match_id: string;
     wallet: string;
+    join_code?: string;
   }): Promise<{
     transaction_base64: string;
     blockhash: string;
@@ -152,6 +205,7 @@ export class matches_service {
     await this.mongo.ensure_ready();
 
     const match_document = await this.get_open_match_or_throw(input.match_id);
+    this.assert_private_join_authorized(match_document, input.wallet, input.join_code);
     if (match_document.player_count >= match_document.max_players) {
       throw new app_error("match is at capacity", 409);
     }
@@ -185,10 +239,12 @@ export class matches_service {
     match_id: string;
     wallet: string;
     tx_signature: string;
+    join_code?: string;
   }): Promise<match_view> {
     await this.mongo.ensure_ready();
 
     const match_document = await this.get_open_match_or_throw(input.match_id);
+    this.assert_private_join_authorized(match_document, input.wallet, input.join_code);
     const market_item = await this.get_market_or_throw(match_document.market_slug);
     const match_entry_pda = this.chain_admin
       .derive_match_entry_pda(market_item.market_index, Number(match_document.match_id), input.wallet)
@@ -232,20 +288,22 @@ export class matches_service {
       { upsert: true }
     );
 
-    if (!existing_entry) {
-      await this.mongo.matches_collection.updateOne(
-        { id: match_document.id },
-        {
-          $inc: {
-            player_count: 1,
-            pot_lamports: match_document.buy_in_lamports
-          },
-          $set: {
-            updated_at_ms: now
-          }
+    const match_snapshot = await this.chain_admin.get_match_snapshot({
+      market_index: market_item.market_index,
+      match_id: Number(match_document.match_id)
+    });
+    const fallback_player_count = match_document.player_count + (existing_entry ? 0 : 1);
+    const fallback_pot_lamports = match_document.pot_lamports + (existing_entry ? 0 : match_document.buy_in_lamports);
+    await this.mongo.matches_collection.updateOne(
+      { id: match_document.id },
+      {
+        $set: {
+          player_count: match_snapshot ? match_snapshot.player_count : fallback_player_count,
+          pot_lamports: match_snapshot ? match_snapshot.pot_lamports : fallback_pot_lamports,
+          updated_at_ms: now
         }
-      );
-    }
+      }
+    );
 
     return this.get_by_id(match_document.id);
   }
@@ -279,8 +337,9 @@ export class matches_service {
       throw new app_error("no joined players in match", 409);
     }
 
-    const normalized_results = await this.compute_results_from_resolved_round_actions({
+    const scoring_round_numbers_by_wallet = await this.compute_scoring_round_numbers_from_chain({
       match_document,
+      market_item,
       entries
     });
 
@@ -306,13 +365,13 @@ export class matches_service {
       });
     }
 
-    for (const result of normalized_results) {
+    for (const entry of entries) {
       try {
         await this.chain_admin.set_match_entry_result({
           market_index: market_item.market_index,
           match_id: Number(match_document.match_id),
-          player_wallet: result.wallet,
-          scoring_round_numbers: result.scoring_round_numbers
+          player_wallet: entry.wallet,
+          scoring_round_numbers: scoring_round_numbers_by_wallet.get(entry.wallet) ?? []
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error ?? "");
@@ -328,8 +387,20 @@ export class matches_service {
       match_id: Number(match_document.match_id)
     });
 
-    const winner_count = normalized_results.filter((result) => result.is_winner).length;
-    const highest_score = normalized_results.reduce((highest, result) => Math.max(highest, result.score), 0);
+    const chain_match_snapshot = await this.chain_admin.get_match_snapshot({
+      market_index: market_item.market_index,
+      match_id: Number(match_document.match_id)
+    });
+    if (!chain_match_snapshot || chain_match_snapshot.status !== "resolved") {
+      throw new app_error("on-chain match is not resolved after finalize", 502);
+    }
+
+    const entry_snapshots = await this.chain_admin.get_match_entry_snapshots({
+      market_index: market_item.market_index,
+      match_id: Number(match_document.match_id),
+      player_wallets: entries.map((entry) => entry.wallet)
+    });
+
     const now = Date.now();
 
     await this.mongo.matches_collection.updateOne(
@@ -339,21 +410,29 @@ export class matches_service {
           status: "resolved",
           lock_tx_signature: lock_tx_signature,
           finalize_tx_signature,
-          winner_count,
-          highest_score,
+          winner_count: chain_match_snapshot.winner_count,
+          highest_score: chain_match_snapshot.highest_score,
           updated_at_ms: now
         }
       }
     );
 
-    for (const result of normalized_results) {
+    for (const entry of entries) {
+      const snapshot = entry_snapshots.get(entry.wallet);
+      if (!snapshot) {
+        throw new app_error(`missing on-chain match entry snapshot for ${entry.wallet}`, 502);
+      }
+      const is_winner =
+        snapshot.result_recorded &&
+        chain_match_snapshot.winner_count > 0 &&
+        snapshot.score === chain_match_snapshot.highest_score;
       await this.mongo.match_entries_collection.updateOne(
-        { _id: `${match_document.id}:${result.wallet}` },
+        { _id: `${match_document.id}:${entry.wallet}` },
         {
           $set: {
-            score: result.score,
-            is_winner: result.is_winner,
-            result_recorded: true,
+            score: snapshot.score,
+            is_winner: is_winner,
+            result_recorded: snapshot.result_recorded,
             updated_at_ms: now
           }
         }
@@ -506,98 +585,54 @@ export class matches_service {
     return this.get_by_id(match_document.id);
   }
 
-  private async compute_results_from_resolved_round_actions(input: {
+  private async compute_scoring_round_numbers_from_chain(input: {
     match_document: match_document;
+    market_item: market;
     entries: match_entry_document[];
-  }): Promise<Array<{ wallet: string; score: number; is_winner: boolean; scoring_round_numbers: number[] }>> {
-    const match_rounds = await this.mongo.rounds_collection
-      .find({
-        market_slug: input.match_document.market_slug,
-        status: "resolved",
-        close_at_ms: {
-          $gte: input.match_document.start_at_ms,
-          $lte: input.match_document.end_at_ms
-        }
-      })
-      .project<{ id: string; round_number: number; winning_side: "yes" | "no" | "skip" | null }>({
-        id: 1,
-        round_number: 1,
-        winning_side: 1
-      })
-      .toArray();
+  }): Promise<Map<string, number[]>> {
+    const round_statuses = await this.chain_admin.get_round_statuses_in_window({
+      market_index: input.market_item.market_index,
+      start_at_ms: Number(input.match_document.start_at_ms),
+      end_at_ms: Number(input.match_document.end_at_ms)
+    });
 
-    if (match_rounds.length === 0) {
-      throw new app_error("no resolved rounds found in match window", 409);
+    if (round_statuses.length === 0) {
+      throw new app_error("no rounds found on-chain in match window", 409);
+    }
+    const unresolved_round_numbers = round_statuses
+      .filter((round_status) => round_status.status !== "resolved")
+      .map((round_status) => round_status.round_number);
+    if (unresolved_round_numbers.length > 0) {
+      const preview = unresolved_round_numbers.slice(0, 6).join(", ");
+      const suffix = unresolved_round_numbers.length > 6 ? ", ..." : "";
+      throw new app_error(
+        `waiting for all rounds to resolve before finalize (pending: ${preview}${suffix})`,
+        409
+      );
+    }
+    const resolved_round_numbers = round_statuses.map((round_status) => round_status.round_number);
+
+    if (resolved_round_numbers.length === 0) {
+      throw new app_error("no resolved rounds found on-chain in match window", 409);
+    }
+    if (resolved_round_numbers.length > max_match_scoring_rounds) {
+      throw new app_error(
+        `resolved rounds exceed on-chain scoring cap (${resolved_round_numbers.length} > ${max_match_scoring_rounds})`,
+        409
+      );
     }
 
-    const round_ids = match_rounds.map((row) => row.id);
-    const wallets = input.entries.map((entry) => entry.wallet);
-    const winning_side_by_round = new Map<string, "yes" | "no" | "skip" | null>(
-      match_rounds.map((row) => [row.id, row.winning_side])
-    );
-    const round_number_by_id = new Map<string, number>(match_rounds.map((row) => [row.id, Number(row.round_number)]));
-
-    const round_actions = await this.mongo.round_actions_collection
-      .find({
-        round_id: { $in: round_ids },
-        wallet: { $in: wallets },
-        tx_signature: { $ne: null }
-      })
-      .project<{ round_id: string; wallet: string; side: "yes" | "no" | "skip" }>({
-        round_id: 1,
-        wallet: 1,
-        side: 1
-      })
-      .toArray();
-
-    if (round_actions.length === 0) {
-      throw new app_error("no verified round actions found for this match window", 409);
-    }
-
-    const score_by_wallet = new Map<string, number>();
-    const scoring_rounds_by_wallet = new Map<string, Set<number>>();
+    const scoring_round_numbers_by_wallet = new Map<string, number[]>();
     for (const entry of input.entries) {
-      score_by_wallet.set(entry.wallet, 0);
-      scoring_rounds_by_wallet.set(entry.wallet, new Set<number>());
+      const scoring_round_numbers = await this.chain_admin.get_wallet_scoring_round_numbers({
+        market_index: input.market_item.market_index,
+        wallet: entry.wallet,
+        round_numbers: resolved_round_numbers
+      });
+      scoring_round_numbers_by_wallet.set(entry.wallet, scoring_round_numbers);
     }
 
-    for (const action of round_actions) {
-      const round_number = round_number_by_id.get(action.round_id);
-      if (round_number && Number.isInteger(round_number) && round_number > 0) {
-        scoring_rounds_by_wallet.get(action.wallet)?.add(round_number);
-      }
-      const winning_side = winning_side_by_round.get(action.round_id);
-      if (!winning_side || winning_side === "skip") {
-        continue;
-      }
-      if (action.side !== winning_side) {
-        continue;
-      }
-      const next_score = (score_by_wallet.get(action.wallet) ?? 0) + 1;
-      if (next_score > 65535) {
-        throw new app_error("computed score exceeds supported range", 500);
-      }
-      score_by_wallet.set(action.wallet, next_score);
-    }
-
-    const normalized = input.entries.map((entry) => ({
-      wallet: entry.wallet,
-      score: score_by_wallet.get(entry.wallet) ?? 0,
-      is_winner: false,
-      scoring_round_numbers: [...(scoring_rounds_by_wallet.get(entry.wallet) ?? new Set<number>())].sort((a, b) => a - b)
-    }));
-
-    const highest_score = normalized.reduce((highest, row) => Math.max(highest, row.score), 0);
-    for (const row of normalized) {
-      row.is_winner = row.score === highest_score;
-    }
-
-    const winner_count = normalized.filter((row) => row.is_winner).length;
-    if (winner_count === 0) {
-      throw new app_error("at least one winner is required", 500);
-    }
-
-    return normalized;
+    return scoring_round_numbers_by_wallet;
   }
 
   private async allocate_match_id(market_slug: string): Promise<number> {
@@ -719,8 +754,12 @@ export class matches_service {
     market_item: market,
     entries: match_entry_document[] = []
   ): match_view {
+    const access_mode = match_document.access_mode === "private" ? "private" : "public";
     return {
       id: match_document.id,
+      createdByWallet: match_document.created_by_wallet ?? null,
+      accessMode: access_mode,
+      requiresJoinCode: access_mode === "private",
       market: market_item,
       marketPda: match_document.market_pda,
       matchId: Number(match_document.match_id),
@@ -753,5 +792,80 @@ export class matches_service {
         claimedAtMs: entry.claimed_at_ms === null ? null : Number(entry.claimed_at_ms)
       }))
     };
+  }
+
+  private assert_private_join_authorized(
+    match_document: match_document,
+    wallet: string,
+    provided_join_code?: string
+  ): void {
+    const access_mode = match_document.access_mode === "private" ? "private" : "public";
+    if (access_mode !== "private") {
+      return;
+    }
+    if (match_document.created_by_wallet && wallet === match_document.created_by_wallet) {
+      return;
+    }
+
+    const expected_hash = match_document.private_join_code_hash ?? "";
+    const salt_hex = match_document.private_join_code_salt ?? "";
+    if (!expected_hash || !salt_hex) {
+      throw new app_error("private match is misconfigured", 500);
+    }
+
+    const normalized_join_code = this.normalize_join_code(provided_join_code);
+    if (!normalized_join_code) {
+      throw new app_error("joinCode is required for this private match", 403);
+    }
+
+    const candidate_hash = this.hash_private_join_code(normalized_join_code, salt_hex);
+    if (!this.safe_hex_equal(expected_hash, candidate_hash)) {
+      throw new app_error("invalid joinCode", 403);
+    }
+  }
+
+  private normalize_join_code(code?: string | null): string | null {
+    if (!code) {
+      return null;
+    }
+    const normalized = code.trim();
+    if (!normalized) {
+      return null;
+    }
+    if (normalized.length < min_private_join_code_length || normalized.length > max_private_join_code_length) {
+      throw new app_error(
+        `joinCode must be between ${min_private_join_code_length} and ${max_private_join_code_length} characters`,
+        400
+      );
+    }
+    return normalized;
+  }
+
+  private build_private_join_code_secret(normalized_join_code: string): {
+    salt_hex: string;
+    hash_hex: string;
+  } {
+    const salt_hex = randomBytes(16).toString("hex");
+    const hash_hex = this.hash_private_join_code(normalized_join_code, salt_hex);
+    return { salt_hex, hash_hex };
+  }
+
+  private hash_private_join_code(normalized_join_code: string, salt_hex: string): string {
+    return createHash("sha256")
+      .update(`${salt_hex}:${env.MATCH_JOIN_CODE_PEPPER}:${normalized_join_code}`)
+      .digest("hex");
+  }
+
+  private safe_hex_equal(expected_hex: string, candidate_hex: string): boolean {
+    try {
+      const expected_buffer = Buffer.from(expected_hex, "hex");
+      const candidate_buffer = Buffer.from(candidate_hex, "hex");
+      if (expected_buffer.length === 0 || expected_buffer.length !== candidate_buffer.length) {
+        return false;
+      }
+      return timingSafeEqual(expected_buffer, candidate_buffer);
+    } catch {
+      return false;
+    }
   }
 }

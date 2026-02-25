@@ -678,12 +678,15 @@ export class ai_duels_service {
 
   async reveal_and_settle(input: {
     duel_record_id: string;
-    admin_wallet: string;
+    wallet: string;
   }): Promise<ai_duel_view> {
     await this.mongo.ensure_ready();
-    this.require_admin_wallet(input.admin_wallet);
 
     const duel_document = await this.get_duel_or_throw(input.duel_record_id);
+    const admin_wallet = this.chain_admin.get_admin_public_key().toBase58();
+    if (input.wallet !== duel_document.player_wallet && input.wallet !== admin_wallet) {
+      throw new app_error("unauthorized", 403);
+    }
     if (duel_document.status === "settled") {
       return this.get_by_id(duel_document.id);
     }

@@ -61,6 +61,24 @@ type round_chain_input = {
 };
 
 type chain_round_status = "predicting" | "locked" | "resolved";
+type chain_match_status = "open" | "locked" | "resolved" | "cancelled";
+
+export type chain_match_snapshot = {
+  status: chain_match_status;
+  player_count: number;
+  winner_count: number;
+  highest_score: number;
+  recorded_result_count: number;
+  pot_lamports: number;
+};
+
+export type chain_match_entry_snapshot = {
+  score: number;
+  joined: boolean;
+  result_recorded: boolean;
+  is_winner: boolean;
+  claimed: boolean;
+};
 
 export type latest_round_snapshot = {
   market_pda: string;
@@ -72,6 +90,12 @@ export type latest_round_snapshot = {
   open_at_ms: number;
   close_at_ms: number;
   winning_side: "yes" | "no" | "skip" | null;
+};
+
+export type round_window_status = {
+  round_number: number;
+  status: chain_round_status;
+  close_at_ms: number;
 };
 
 export type prepared_prediction_transaction = {
@@ -123,6 +147,7 @@ const claim_match_payout_discriminator = discriminator("claim_match_payout");
 const open_ai_duel_discriminator = discriminator("open_ai_duel");
 const append_ai_duel_turn_discriminator = discriminator("append_ai_duel_turn");
 const claim_ai_duel_payout_discriminator = discriminator("claim_ai_duel_payout");
+const accounts_batch_size = 100;
 
 const side_from_raw = (raw: number): decision_side => {
   if (raw === 0) {
@@ -243,6 +268,160 @@ export class chain_admin_service {
       close_at_ms: decoded.close_at_ts * 1000,
       winning_side: decoded.winning_side
     };
+  }
+
+  async get_resolved_round_numbers_in_window(input: {
+    market_index: number;
+    start_at_ms: number;
+    end_at_ms: number;
+  }): Promise<number[]> {
+    const round_statuses = await this.get_round_statuses_in_window(input);
+    const resolved_round_numbers = round_statuses
+      .filter((round_status) => round_status.status === "resolved")
+      .map((round_status) => round_status.round_number);
+    return [...new Set(resolved_round_numbers)].sort((a, b) => a - b);
+  }
+
+  async get_round_statuses_in_window(input: {
+    market_index: number;
+    start_at_ms: number;
+    end_at_ms: number;
+  }): Promise<round_window_status[]> {
+    if (input.end_at_ms < input.start_at_ms) {
+      throw new app_error("invalid round window", 400);
+    }
+
+    const latest_round_snapshot = await this.get_latest_round_snapshot(input.market_index);
+    if (!latest_round_snapshot || latest_round_snapshot.round_number < 1) {
+      return [];
+    }
+
+    const market_pda = this.derive_market_pda(input.market_index);
+    const latest_round_number = Number(latest_round_snapshot.round_number);
+    const statuses: round_window_status[] = [];
+
+    for (let start_round_number = 1; start_round_number <= latest_round_number; start_round_number += accounts_batch_size) {
+      const end_round_number = Math.min(start_round_number + accounts_batch_size - 1, latest_round_number);
+      const chunk_round_numbers: number[] = [];
+      const chunk_round_accounts: PublicKey[] = [];
+
+      for (let round_number = start_round_number; round_number <= end_round_number; round_number += 1) {
+        chunk_round_numbers.push(round_number);
+        chunk_round_accounts.push(derive_round_pda(this.program_id, market_pda, round_number));
+      }
+
+      const account_infos = await this.base_connection.getMultipleAccountsInfo(chunk_round_accounts, "confirmed");
+      for (let index = 0; index < account_infos.length; index += 1) {
+        const account_info = account_infos[index];
+        if (!account_info || !account_info.owner.equals(this.program_id)) {
+          continue;
+        }
+
+        const decoded = this.decode_round_account(account_info.data);
+        const close_at_ms = decoded.close_at_ts * 1_000;
+        if (close_at_ms < input.start_at_ms || close_at_ms > input.end_at_ms) {
+          continue;
+        }
+
+        const round_number = chunk_round_numbers[index];
+        if (round_number > 0) {
+          statuses.push({
+            round_number,
+            status: decoded.status,
+            close_at_ms
+          });
+        }
+      }
+    }
+
+    return statuses.sort((a, b) => a.round_number - b.round_number);
+  }
+
+  async get_wallet_scoring_round_numbers(input: {
+    market_index: number;
+    wallet: string;
+    round_numbers: number[];
+  }): Promise<number[]> {
+    const deduped_round_numbers = [...new Set(input.round_numbers)]
+      .filter((value) => Number.isInteger(value) && value > 0)
+      .sort((a, b) => a - b);
+    if (deduped_round_numbers.length === 0) {
+      return [];
+    }
+
+    const market_pda = this.derive_market_pda(input.market_index);
+    const player = new PublicKey(input.wallet);
+    const scoring_round_numbers: number[] = [];
+
+    for (let index = 0; index < deduped_round_numbers.length; index += accounts_batch_size) {
+      const chunk_round_numbers = deduped_round_numbers.slice(index, index + accounts_batch_size);
+      const chunk_position_accounts = chunk_round_numbers.map((round_number) => {
+        const round_pda = derive_round_pda(this.program_id, market_pda, round_number);
+        return derive_position_pda(this.program_id, round_pda, player);
+      });
+
+      const account_infos = await this.base_connection.getMultipleAccountsInfo(chunk_position_accounts, "confirmed");
+      for (let account_index = 0; account_index < account_infos.length; account_index += 1) {
+        const account_info = account_infos[account_index];
+        if (!account_info || !account_info.owner.equals(this.program_id)) {
+          continue;
+        }
+        scoring_round_numbers.push(chunk_round_numbers[account_index]!);
+      }
+    }
+
+    return [...new Set(scoring_round_numbers)].sort((a, b) => a - b);
+  }
+
+  async get_match_snapshot(input: {
+    market_index: number;
+    match_id: number;
+  }): Promise<chain_match_snapshot | null> {
+    const match_pda = this.derive_match_pda(input.market_index, input.match_id);
+    const match_account = await this.base_connection.getAccountInfo(match_pda, "confirmed");
+    if (!match_account) {
+      return null;
+    }
+    if (!match_account.owner.equals(this.program_id)) {
+      throw new app_error("invalid match account owner", 502);
+    }
+    return this.decode_match_account(match_account.data);
+  }
+
+  async get_match_entry_snapshots(input: {
+    market_index: number;
+    match_id: number;
+    player_wallets: string[];
+  }): Promise<Map<string, chain_match_entry_snapshot>> {
+    const deduped_wallets = [...new Set(input.player_wallets)]
+      .map((wallet) => wallet.trim())
+      .filter((wallet) => wallet.length > 0);
+    const snapshots = new Map<string, chain_match_entry_snapshot>();
+    if (deduped_wallets.length === 0) {
+      return snapshots;
+    }
+
+    const match_pda = this.derive_match_pda(input.market_index, input.match_id);
+
+    for (let index = 0; index < deduped_wallets.length; index += accounts_batch_size) {
+      const chunk_wallets = deduped_wallets.slice(index, index + accounts_batch_size);
+      const chunk_entry_accounts = chunk_wallets.map((wallet) => {
+        const player = new PublicKey(wallet);
+        return derive_match_entry_pda(this.program_id, match_pda, player);
+      });
+
+      const account_infos = await this.base_connection.getMultipleAccountsInfo(chunk_entry_accounts, "confirmed");
+      for (let account_index = 0; account_index < account_infos.length; account_index += 1) {
+        const account_info = account_infos[account_index];
+        if (!account_info || !account_info.owner.equals(this.program_id)) {
+          continue;
+        }
+        const wallet = chunk_wallets[account_index]!;
+        snapshots.set(wallet, this.decode_match_entry_account(account_info.data));
+      }
+    }
+
+    return snapshots;
   }
 
   async ensure_market_initialized(input: market_chain_input): Promise<{ market_pda: string; initialize_tx_signature: string | null }> {
@@ -1584,6 +1763,131 @@ export class chain_admin_service {
       close_at_ts,
       winning_side
     };
+  }
+
+  private decode_match_account(data_buffer: Buffer | Uint8Array): chain_match_snapshot {
+    const data = Buffer.from(data_buffer);
+    let offset = 8;
+
+    const ensure_available = (bytes: number) => {
+      if (offset + bytes > data.length) {
+        throw new app_error("invalid match account data", 502);
+      }
+    };
+
+    ensure_available(32);
+    offset += 32;
+    ensure_available(32);
+    offset += 32;
+    ensure_available(8);
+    offset += 8;
+    ensure_available(8);
+    offset += 8;
+
+    ensure_available(1);
+    offset += 1;
+
+    ensure_available(1);
+    const player_count = data.readUInt8(offset);
+    offset += 1;
+
+    ensure_available(8);
+    offset += 8;
+    ensure_available(8);
+    offset += 8;
+
+    ensure_available(1);
+    const status_raw = data.readUInt8(offset);
+    offset += 1;
+    const status = this.decode_match_status(status_raw);
+
+    ensure_available(8);
+    const pot_lamports = Number(data.readBigUInt64LE(offset));
+    offset += 8;
+    if (!Number.isSafeInteger(pot_lamports)) {
+      throw new app_error("invalid match pot amount", 502);
+    }
+
+    ensure_available(1);
+    const winner_count = data.readUInt8(offset);
+    offset += 1;
+
+    ensure_available(2);
+    const highest_score = data.readUInt16LE(offset);
+    offset += 2;
+
+    ensure_available(1);
+    const recorded_result_count = data.readUInt8(offset);
+
+    return {
+      status,
+      player_count,
+      winner_count,
+      highest_score,
+      recorded_result_count,
+      pot_lamports
+    };
+  }
+
+  private decode_match_entry_account(data_buffer: Buffer | Uint8Array): chain_match_entry_snapshot {
+    const data = Buffer.from(data_buffer);
+    let offset = 8;
+
+    const ensure_available = (bytes: number) => {
+      if (offset + bytes > data.length) {
+        throw new app_error("invalid match entry account data", 502);
+      }
+    };
+
+    ensure_available(32);
+    offset += 32;
+    ensure_available(32);
+    offset += 32;
+    ensure_available(8);
+    offset += 8;
+
+    ensure_available(2);
+    const score = data.readUInt16LE(offset);
+    offset += 2;
+
+    ensure_available(1);
+    const joined = data.readUInt8(offset) === 1;
+    offset += 1;
+
+    ensure_available(1);
+    const result_recorded = data.readUInt8(offset) === 1;
+    offset += 1;
+
+    ensure_available(1);
+    const is_winner = data.readUInt8(offset) === 1;
+    offset += 1;
+
+    ensure_available(1);
+    const claimed = data.readUInt8(offset) === 1;
+
+    return {
+      score,
+      joined,
+      result_recorded,
+      is_winner,
+      claimed
+    };
+  }
+
+  private decode_match_status(raw: number): chain_match_status {
+    if (raw === 0) {
+      return "open";
+    }
+    if (raw === 1) {
+      return "locked";
+    }
+    if (raw === 2) {
+      return "resolved";
+    }
+    if (raw === 3) {
+      return "cancelled";
+    }
+    throw new app_error("invalid match status", 502);
   }
 
   private async wait_for_account_owner(
