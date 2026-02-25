@@ -38,8 +38,3 @@ export type match_view = {
   updatedAtMs: number;
   entries: match_entry_view[];
 };
-
-export type match_result_input = {
-  wallet: string;
-  score: number;
-};

@@ -10,7 +10,6 @@ import type { chain_admin_service } from "@/features/chain/chain-admin.service";
 import { PublicKey } from "@solana/web3.js";
 import type { account_type } from "@/features/chain/ubalance-program";
 import type {
-  match_result_input,
   match_status,
   match_view
 } from "@/features/matches/matches.model";
@@ -254,7 +253,6 @@ export class matches_service {
   async finalize_match(input: {
     admin_wallet: string;
     match_id: string;
-    results: match_result_input[];
   }): Promise<match_view> {
     await this.mongo.ensure_ready();
     this.require_admin_wallet(input.admin_wallet);
@@ -281,7 +279,10 @@ export class matches_service {
       throw new app_error("no joined players in match", 409);
     }
 
-    const normalized_results = this.normalize_results_or_throw(entries, input.results);
+    const normalized_results = await this.compute_results_from_resolved_round_actions({
+      match_document,
+      entries
+    });
 
     await this.ensure_undelegated(match_document.match_pda, {
       kind: "match",
@@ -306,13 +307,20 @@ export class matches_service {
     }
 
     for (const result of normalized_results) {
-      await this.chain_admin.set_match_entry_result({
-        market_index: market_item.market_index,
-        match_id: Number(match_document.match_id),
-        player_wallet: result.wallet,
-        score: result.score,
-        is_winner: result.is_winner
-      });
+      try {
+        await this.chain_admin.set_match_entry_result({
+          market_index: market_item.market_index,
+          match_id: Number(match_document.match_id),
+          player_wallet: result.wallet,
+          scoring_round_numbers: result.scoring_round_numbers
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error ?? "");
+        if (message.includes("Error Code: MatchResultAlreadyRecorded") || message.includes("Error Code: MatchResultsComplete")) {
+          continue;
+        }
+        throw error;
+      }
     }
 
     const finalize_tx_signature = await this.chain_admin.finalize_match({
@@ -498,49 +506,95 @@ export class matches_service {
     return this.get_by_id(match_document.id);
   }
 
-  private normalize_results_or_throw(
-    entries: match_entry_document[],
-    results: match_result_input[]
-  ): Array<{ wallet: string; score: number; is_winner: boolean }> {
-    if (results.length === 0) {
-      throw new app_error("results are required", 400);
+  private async compute_results_from_resolved_round_actions(input: {
+    match_document: match_document;
+    entries: match_entry_document[];
+  }): Promise<Array<{ wallet: string; score: number; is_winner: boolean; scoring_round_numbers: number[] }>> {
+    const match_rounds = await this.mongo.rounds_collection
+      .find({
+        market_slug: input.match_document.market_slug,
+        status: "resolved",
+        close_at_ms: {
+          $gte: input.match_document.start_at_ms,
+          $lte: input.match_document.end_at_ms
+        }
+      })
+      .project<{ id: string; round_number: number; winning_side: "yes" | "no" | "skip" | null }>({
+        id: 1,
+        round_number: 1,
+        winning_side: 1
+      })
+      .toArray();
+
+    if (match_rounds.length === 0) {
+      throw new app_error("no resolved rounds found in match window", 409);
     }
 
-    const entry_wallets = new Set(entries.map((entry) => entry.wallet));
-    const result_wallets = new Set<string>();
-    for (const result of results) {
-      if (!entry_wallets.has(result.wallet)) {
-        throw new app_error(`result wallet ${result.wallet} is not a match participant`, 400);
-      }
-      if (result_wallets.has(result.wallet)) {
-        throw new app_error(`duplicate result wallet ${result.wallet}`, 400);
-      }
-      if (!Number.isInteger(result.score) || result.score < 0 || result.score > 65535) {
-        throw new app_error(`invalid score for wallet ${result.wallet}`, 400);
-      }
-      result_wallets.add(result.wallet);
+    const round_ids = match_rounds.map((row) => row.id);
+    const wallets = input.entries.map((entry) => entry.wallet);
+    const winning_side_by_round = new Map<string, "yes" | "no" | "skip" | null>(
+      match_rounds.map((row) => [row.id, row.winning_side])
+    );
+    const round_number_by_id = new Map<string, number>(match_rounds.map((row) => [row.id, Number(row.round_number)]));
+
+    const round_actions = await this.mongo.round_actions_collection
+      .find({
+        round_id: { $in: round_ids },
+        wallet: { $in: wallets },
+        tx_signature: { $ne: null }
+      })
+      .project<{ round_id: string; wallet: string; side: "yes" | "no" | "skip" }>({
+        round_id: 1,
+        wallet: 1,
+        side: 1
+      })
+      .toArray();
+
+    if (round_actions.length === 0) {
+      throw new app_error("no verified round actions found for this match window", 409);
     }
 
-    if (entry_wallets.size !== result_wallets.size) {
-      throw new app_error("results must include every joined player exactly once", 400);
+    const score_by_wallet = new Map<string, number>();
+    const scoring_rounds_by_wallet = new Map<string, Set<number>>();
+    for (const entry of input.entries) {
+      score_by_wallet.set(entry.wallet, 0);
+      scoring_rounds_by_wallet.set(entry.wallet, new Set<number>());
     }
 
-    let highest_score = 0;
-    for (const result of results) {
-      if (result.score > highest_score) {
-        highest_score = result.score;
+    for (const action of round_actions) {
+      const round_number = round_number_by_id.get(action.round_id);
+      if (round_number && Number.isInteger(round_number) && round_number > 0) {
+        scoring_rounds_by_wallet.get(action.wallet)?.add(round_number);
       }
+      const winning_side = winning_side_by_round.get(action.round_id);
+      if (!winning_side || winning_side === "skip") {
+        continue;
+      }
+      if (action.side !== winning_side) {
+        continue;
+      }
+      const next_score = (score_by_wallet.get(action.wallet) ?? 0) + 1;
+      if (next_score > 65535) {
+        throw new app_error("computed score exceeds supported range", 500);
+      }
+      score_by_wallet.set(action.wallet, next_score);
     }
 
-    const normalized = results.map((result) => ({
-      wallet: result.wallet,
-      score: result.score,
-      is_winner: result.score === highest_score
+    const normalized = input.entries.map((entry) => ({
+      wallet: entry.wallet,
+      score: score_by_wallet.get(entry.wallet) ?? 0,
+      is_winner: false,
+      scoring_round_numbers: [...(scoring_rounds_by_wallet.get(entry.wallet) ?? new Set<number>())].sort((a, b) => a - b)
     }));
+
+    const highest_score = normalized.reduce((highest, row) => Math.max(highest, row.score), 0);
+    for (const row of normalized) {
+      row.is_winner = row.score === highest_score;
+    }
 
     const winner_count = normalized.filter((row) => row.is_winner).length;
     if (winner_count === 0) {
-      throw new app_error("at least one winner is required", 400);
+      throw new app_error("at least one winner is required", 500);
     }
 
     return normalized;

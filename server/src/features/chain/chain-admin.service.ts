@@ -8,6 +8,7 @@ import { Connection, Keypair, PublicKey, Transaction, TransactionInstruction } f
 import { env } from "@/config/env";
 import { app_error } from "@/shared/app-error";
 import {
+  create_append_ai_duel_turn_instruction,
   create_cancel_match_instruction,
   create_claim_ai_duel_payout_instruction,
   create_claim_match_payout_instruction,
@@ -18,6 +19,7 @@ import {
   create_finalize_match_instruction,
   create_fund_house_bankroll_instruction,
   create_init_house_bankroll_instruction,
+  create_init_market_oracle_instruction,
   create_initialize_market_instruction,
   create_join_match_instruction,
   create_lock_match_instruction,
@@ -36,6 +38,7 @@ import {
   derive_ai_duel_pda,
   derive_house_bankroll_pda,
   derive_market_pda,
+  derive_market_oracle_pda,
   derive_match_entry_pda,
   derive_match_pda,
   derive_position_pda,
@@ -98,6 +101,14 @@ const load_admin_secret_key = (): Uint8Array => {
   return parse_secret_key(env.UBALANCE_ADMIN_SECRET_KEY);
 };
 
+const parse_oracle_feed_id_hex = (value: string): Uint8Array => {
+  const normalized = value.trim().toLowerCase().replace(/^0x/, "");
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new app_error("invalid oracle feed id hex", 400);
+  }
+  return Uint8Array.from(Buffer.from(normalized, "hex"));
+};
+
 const sleep = async (ms: number): Promise<void> => {
   await new Promise((resolve_sleep) => setTimeout(resolve_sleep, ms));
 };
@@ -110,6 +121,7 @@ const place_prediction_discriminator = discriminator("place_prediction");
 const join_match_discriminator = discriminator("join_match");
 const claim_match_payout_discriminator = discriminator("claim_match_payout");
 const open_ai_duel_discriminator = discriminator("open_ai_duel");
+const append_ai_duel_turn_discriminator = discriminator("append_ai_duel_turn");
 const claim_ai_duel_payout_discriminator = discriminator("claim_ai_duel_payout");
 
 const side_from_raw = (raw: number): decision_side => {
@@ -154,6 +166,11 @@ export class chain_admin_service {
   derive_round_pda(market_index: number, round_number: number): PublicKey {
     const market_pda = this.derive_market_pda(market_index);
     return derive_round_pda(this.program_id, market_pda, round_number);
+  }
+
+  derive_market_oracle_pda(market_index: number): PublicKey {
+    const market_pda = this.derive_market_pda(market_index);
+    return derive_market_oracle_pda(this.program_id, market_pda);
   }
 
   derive_match_pda(market_index: number, match_id: number): PublicKey {
@@ -263,6 +280,37 @@ export class chain_admin_service {
     }
   }
 
+  async ensure_market_oracle_initialized(input: {
+    market_index: number;
+    oracle_feed_id_hex: string;
+  }): Promise<{ market_oracle_pda: string; initialize_tx_signature: string | null }> {
+    const market_pda = this.derive_market_pda(input.market_index);
+    const market_oracle_pda = derive_market_oracle_pda(this.program_id, market_pda);
+    const existing = await this.base_connection.getAccountInfo(market_oracle_pda, "confirmed");
+    if (existing) {
+      return { market_oracle_pda: market_oracle_pda.toBase58(), initialize_tx_signature: null };
+    }
+
+    const initialize_ix = create_init_market_oracle_instruction({
+      program_id: this.program_id,
+      admin: this.admin.publicKey,
+      market_pda,
+      market_oracle_pda,
+      oracle_feed_id: parse_oracle_feed_id_hex(input.oracle_feed_id_hex)
+    });
+
+    try {
+      const signature = await this.send_base_transaction([initialize_ix], "initialize market oracle");
+      return { market_oracle_pda: market_oracle_pda.toBase58(), initialize_tx_signature: signature };
+    } catch (error) {
+      const existing_after_error = await this.base_connection.getAccountInfo(market_oracle_pda, "confirmed");
+      if (existing_after_error) {
+        return { market_oracle_pda: market_oracle_pda.toBase58(), initialize_tx_signature: null };
+      }
+      throw error;
+    }
+  }
+
   async open_round(input: round_chain_input): Promise<{
     market_pda: string;
     round_pda: string;
@@ -358,24 +406,30 @@ export class chain_admin_service {
     market_index: number;
     match_id: number;
     player_wallet: string;
-    score: number;
-    is_winner: boolean;
+    scoring_round_numbers: number[];
   }): Promise<string> {
     const market_pda = this.derive_market_pda(input.market_index);
     const match_pda = derive_match_pda(this.program_id, market_pda, input.match_id);
-    const match_entry_pda = derive_match_entry_pda(this.program_id, match_pda, new PublicKey(input.player_wallet));
+    const player = new PublicKey(input.player_wallet);
+    const match_entry_pda = derive_match_entry_pda(this.program_id, match_pda, player);
+    const deduped_round_numbers = [...new Set(input.scoring_round_numbers)]
+      .filter((value) => Number.isInteger(value) && value > 0)
+      .sort((a, b) => a - b);
+    const scoring_account_pairs = deduped_round_numbers.map((round_number) => {
+      const round_pda = derive_round_pda(this.program_id, market_pda, round_number);
+      const position_pda = derive_position_pda(this.program_id, round_pda, player);
+      return { round_pda, position_pda };
+    });
 
     const set_result_ix = create_set_match_entry_result_instruction({
       program_id: this.program_id,
-      admin: this.admin.publicKey,
       market_pda,
       match_pda,
       match_entry_pda,
-      score: input.score,
-      is_winner: input.is_winner
+      scoring_account_pairs
     });
 
-    return this.send_base_transaction([set_result_ix], "set match result");
+    return this.send_base_transaction([set_result_ix], "set match result from on-chain rounds");
   }
 
   async finalize_match(input: { market_index: number; match_id: number }): Promise<string> {
@@ -598,17 +652,19 @@ export class chain_admin_service {
   async resolve_round(input: {
     market_index: number;
     round_number: number;
-    settlement_price: number;
+    oracle_price_feed: string;
   }): Promise<string> {
     const market_pda = this.derive_market_pda(input.market_index);
+    const market_oracle_pda = derive_market_oracle_pda(this.program_id, market_pda);
     const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
 
     const resolve_ix = create_resolve_round_instruction({
       program_id: this.program_id,
-      admin: this.admin.publicKey,
       market_pda,
+      platform_fee_receiver: this.admin.publicKey,
+      market_oracle_pda,
       round_pda,
-      settlement_price: to_lamports_price(input.settlement_price)
+      oracle_price_feed: new PublicKey(input.oracle_price_feed)
     });
 
     return this.send_base_transaction([resolve_ix], "resolve round");
@@ -753,6 +809,49 @@ export class chain_admin_service {
     };
   }
 
+  async prepare_append_ai_duel_turn_transaction(input: {
+    user_wallet: string;
+    market_index: number;
+    round_number: number;
+    duel_id: number;
+    player_side: decision_side;
+    amount_lamports: number;
+    ai_commitment: Uint8Array;
+  }): Promise<prepared_prediction_transaction & {
+    market_pda: string;
+    round_pda: string;
+    house_bankroll_pda: string;
+    ai_duel_pda: string;
+  }> {
+    const player = new PublicKey(input.user_wallet);
+    const market_pda = this.derive_market_pda(input.market_index);
+    const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
+    const house_bankroll_pda = derive_house_bankroll_pda(this.program_id, this.admin.publicKey);
+    const ai_duel_pda = derive_ai_duel_pda(this.program_id, market_pda, player, input.duel_id);
+
+    const ix = create_append_ai_duel_turn_instruction({
+      program_id: this.program_id,
+      player,
+      market_pda,
+      round_pda,
+      house_bankroll_pda,
+      ai_duel_pda,
+      duel_id: input.duel_id,
+      player_side: input.player_side,
+      amount_lamports: input.amount_lamports,
+      ai_commitment: input.ai_commitment
+    });
+
+    const prepared = await this.prepare_transaction(this.er_connection, ix);
+    return {
+      ...prepared,
+      market_pda: market_pda.toBase58(),
+      round_pda: round_pda.toBase58(),
+      house_bankroll_pda: house_bankroll_pda.toBase58(),
+      ai_duel_pda: ai_duel_pda.toBase58()
+    };
+  }
+
   async reveal_ai_duel(input: {
     market_index: number;
     player_wallet: string;
@@ -785,6 +884,8 @@ export class chain_admin_service {
     player_wallet: string;
     duel_id: number;
     round_number: number;
+    ai_sides: decision_side[];
+    nonces: Uint8Array[];
   }): Promise<string> {
     const market_pda = this.derive_market_pda(input.market_index);
     const round_pda = derive_round_pda(this.program_id, market_pda, input.round_number);
@@ -802,7 +903,9 @@ export class chain_admin_service {
       market_pda,
       round_pda,
       house_bankroll_pda,
-      ai_duel_pda
+      ai_duel_pda,
+      ai_sides: input.ai_sides,
+      nonces: input.nonces
     });
 
     return this.send_base_transaction([settle_ix], "settle ai duel");
@@ -1091,6 +1194,82 @@ export class chain_admin_service {
     throw new app_error("open_ai_duel instruction not found in transaction", 400);
   }
 
+  async verify_append_ai_duel_turn_transaction(input: {
+    tx_signature: string;
+    expected_wallet: string;
+    expected_market_pda: string;
+    expected_round_pda: string;
+    expected_house_bankroll_pda: string;
+    expected_ai_duel_pda: string;
+    expected_duel_id: number;
+    expected_player_side: decision_side;
+    expected_amount_lamports: number;
+    expected_ai_commitment: Uint8Array;
+  }): Promise<void> {
+    const parsed = await this.get_parsed_transaction_with_retry(this.er_connection, input.tx_signature);
+    if (!parsed) {
+      throw new app_error("append ai duel turn transaction not found", 400);
+    }
+    if (parsed.meta?.err) {
+      throw new app_error("append ai duel turn transaction failed", 400);
+    }
+
+    const expected_wallet = new PublicKey(input.expected_wallet).toBase58();
+    const expected_market = new PublicKey(input.expected_market_pda).toBase58();
+    const expected_round = new PublicKey(input.expected_round_pda).toBase58();
+    const expected_house = new PublicKey(input.expected_house_bankroll_pda).toBase58();
+    const expected_duel = new PublicKey(input.expected_ai_duel_pda).toBase58();
+    const expected_program = this.program_id.toBase58();
+    const expected_system_program = "11111111111111111111111111111111";
+
+    this.require_signer(parsed, expected_wallet, "append ai duel turn transaction missing expected wallet signer");
+
+    for (const instruction of parsed.transaction.message.instructions as any[]) {
+      const instruction_program =
+        typeof instruction?.programId === "string"
+          ? instruction.programId
+          : instruction?.programId?.toBase58?.();
+      if (instruction_program !== expected_program) {
+        continue;
+      }
+      if (!Array.isArray(instruction?.accounts) || typeof instruction?.data !== "string") {
+        continue;
+      }
+
+      const accounts = instruction.accounts.map((account: any) =>
+        typeof account === "string" ? account : account?.toBase58?.()
+      );
+      if (accounts.length < 6) {
+        continue;
+      }
+
+      if (
+        accounts[0] !== expected_wallet ||
+        accounts[1] !== expected_market ||
+        accounts[2] !== expected_round ||
+        accounts[3] !== expected_house ||
+        accounts[4] !== expected_duel ||
+        accounts[5] !== expected_system_program
+      ) {
+        continue;
+      }
+
+      const decoded = this.decode_append_ai_duel_turn_data(instruction.data);
+      const expected_commitment = Buffer.from(input.expected_ai_commitment);
+      if (
+        decoded.duel_id !== input.expected_duel_id ||
+        decoded.player_side !== input.expected_player_side ||
+        decoded.amount_lamports !== input.expected_amount_lamports ||
+        !decoded.ai_commitment.equals(expected_commitment)
+      ) {
+        throw new app_error("append ai duel turn transaction data mismatch", 400);
+      }
+      return;
+    }
+
+    throw new app_error("append_ai_duel_turn instruction not found in transaction", 400);
+  }
+
   async verify_claim_ai_duel_payout_transaction(input: {
     tx_signature: string;
     expected_wallet: string;
@@ -1229,12 +1408,42 @@ export class chain_admin_service {
     amount_lamports: number;
     ai_commitment: Buffer;
   } {
+    return this.decode_ai_duel_turn_payload(
+      data_base58,
+      open_ai_duel_discriminator,
+      "open ai duel"
+    );
+  }
+
+  private decode_append_ai_duel_turn_data(data_base58: string): {
+    duel_id: number;
+    player_side: decision_side;
+    amount_lamports: number;
+    ai_commitment: Buffer;
+  } {
+    return this.decode_ai_duel_turn_payload(
+      data_base58,
+      append_ai_duel_turn_discriminator,
+      "append ai duel turn"
+    );
+  }
+
+  private decode_ai_duel_turn_payload(
+    data_base58: string,
+    expected_discriminator: Buffer,
+    instruction_name: string
+  ): {
+    duel_id: number;
+    player_side: decision_side;
+    amount_lamports: number;
+    ai_commitment: Buffer;
+  } {
     const raw = this.decode_instruction_data(data_base58);
     if (raw.length !== 57) {
-      throw new app_error("open ai duel instruction data length mismatch", 400);
+      throw new app_error(`${instruction_name} instruction data length mismatch`, 400);
     }
     const discriminator_raw = raw.subarray(0, 8);
-    if (!Buffer.from(discriminator_raw).equals(open_ai_duel_discriminator)) {
+    if (!Buffer.from(discriminator_raw).equals(expected_discriminator)) {
       throw new app_error("unexpected instruction discriminator", 400);
     }
 

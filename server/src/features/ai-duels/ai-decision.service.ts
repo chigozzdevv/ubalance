@@ -26,7 +26,24 @@ type ai_decision_request = {
   wallet: string;
   market: market;
   round: round_document;
+  player_side: decision_side;
+  amount_lamports: number;
+  recent_user_performance: {
+    overall: ai_user_performance_summary;
+    market: ai_user_performance_summary;
+  };
   recent_resolved_rounds: round_document[];
+};
+
+export type ai_user_performance_summary = {
+  sample_size: number;
+  player_wins: number;
+  house_wins: number;
+  pushes: number;
+  player_win_rate_ex_push: number | null;
+  avg_stake_lamports: number | null;
+  avg_player_roi_pct: number | null;
+  recent_outcomes: Array<"player_win" | "house_win" | "push">;
 };
 
 export type ai_decision_result = {
@@ -159,6 +176,11 @@ export class ai_decision_service {
           action_count: Number(input.round.totals.action_count)
         }
       },
+      player: {
+        side: input.player_side,
+        amount_lamports: input.amount_lamports,
+        recent_performance: input.recent_user_performance
+      },
       prices: {
         latest_price,
         price_points,
@@ -172,6 +194,8 @@ export class ai_decision_service {
       rules: {
         choose_yes_if_expected_settlement_above_reference: true,
         choose_no_if_expected_settlement_below_reference: true,
+        consider_player_side_and_stake: true,
+        consider_recent_player_performance: true,
         must_choose_one_of: ["yes", "no"]
       }
     };
@@ -279,7 +303,7 @@ export class ai_decision_service {
         {
           role: "system",
           content:
-            "You are a market decision engine for a short-horizon prediction game. Decide whether the round settlement price at close is ABOVE (yes) or BELOW (no) the reference price. Use only the provided context. Return strict JSON matching schema."
+            "You are a market decision engine for a short-horizon prediction game. Decide whether the round settlement price at close is ABOVE (yes) or BELOW (no) the reference price. Use only the provided context, including player side, stake size, and recent player performance. Return strict JSON matching schema."
         },
         {
           role: "user",

@@ -22,15 +22,6 @@ const confirm_tx_schema = z.object({
   txSignature: z.string().min(20).max(128)
 });
 
-const finalize_match_schema = z.object({
-  results: z.array(
-    z.object({
-      wallet: z.string().min(32).max(64),
-      score: z.coerce.number().int().min(0).max(65535)
-    })
-  ).min(1)
-});
-
 export class matches_controller {
   constructor(private readonly service: matches_service) {}
 
@@ -138,11 +129,9 @@ export class matches_controller {
       }
 
       const match_id = (request.params as any).matchId as string;
-      const payload = finalize_match_schema.parse(request.body ?? {});
       const updated = await this.service.finalize_match({
         admin_wallet: wallet,
-        match_id,
-        results: payload.results
+        match_id
       });
 
       reply.send(ok(updated));

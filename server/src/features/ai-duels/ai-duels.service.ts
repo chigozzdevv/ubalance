@@ -4,18 +4,28 @@ import { env } from "@/config/env";
 import { app_error } from "@/shared/app-error";
 import type {
   ai_duel_document,
+  ai_duel_turn_document,
   mongo_service
 } from "@/shared/mongo";
 import type { markets_service } from "@/features/markets/markets.service";
 import type { market } from "@/features/markets/markets.model";
 import type { chain_admin_service } from "@/features/chain/chain-admin.service";
 import type { decision_side } from "@/features/rounds/rounds.model";
-import type { ai_duel_outcome, ai_duel_status, ai_duel_view } from "@/features/ai-duels/ai-duels.model";
+import type {
+  ai_duel_outcome,
+  ai_duel_status,
+  ai_duel_turn_view,
+  ai_duel_view
+} from "@/features/ai-duels/ai-duels.model";
 import type { account_type } from "@/features/chain/ubalance-program";
-import type { ai_decision_service } from "@/features/ai-duels/ai-decision.service";
+import type { ai_decision_service, ai_user_performance_summary } from "@/features/ai-duels/ai-decision.service";
 
 const ai_duel_commit_domain = Buffer.from("ubalance-ai-duel", "utf8");
 const max_list_limit = 100;
+const recent_market_rounds_limit = 20;
+const recent_user_overall_duels_limit = 30;
+const recent_user_market_duels_limit = 20;
+const active_duel_statuses: ai_duel_status[] = ["prepared", "open", "revealed"];
 
 export class ai_duels_service {
   constructor(
@@ -188,32 +198,73 @@ export class ai_duels_service {
 
     const round_number = Number(round_document.round_number);
     await this.ensure_round_delegated(market_item.market_index, round_number);
+    await this.expire_stale_prepared_duels();
+    await this.assert_open_exposure_limits({
+      wallet: input.wallet,
+      market_slug: market_item.slug,
+      round_id: round_document.id,
+      additional_amount_lamports: input.amount_lamports,
+      increment_open_duel_count: true
+    });
 
     const duel_id = await this.allocate_duel_id(market_item.slug, input.wallet);
-    const recent_resolved_rounds = await this.mongo.rounds_collection
-      .find({
-        market_slug: market_item.slug,
-        status: "resolved",
-        settlement_price: { $ne: null }
-      })
-      .sort({ close_at_ms: -1 })
-      .limit(20)
-      .toArray();
+    const [recent_resolved_rounds, recent_user_overall_duels, recent_user_market_duels] = await Promise.all([
+      this.mongo.rounds_collection
+        .find({
+          market_slug: market_item.slug,
+          status: "resolved",
+          settlement_price: { $ne: null }
+        })
+        .sort({ close_at_ms: -1 })
+        .limit(recent_market_rounds_limit)
+        .toArray(),
+      this.mongo.ai_duels_collection
+        .find({
+          player_wallet: input.wallet,
+          status: "settled",
+          outcome: { $in: ["player_win", "house_win", "push"] }
+        })
+        .sort({ created_at_ms: -1 })
+        .limit(recent_user_overall_duels_limit)
+        .toArray(),
+      this.mongo.ai_duels_collection
+        .find({
+          player_wallet: input.wallet,
+          market_slug: market_item.slug,
+          status: "settled",
+          outcome: { $in: ["player_win", "house_win", "push"] }
+        })
+        .sort({ created_at_ms: -1 })
+        .limit(recent_user_market_duels_limit)
+        .toArray()
+    ]);
+
+    const recent_user_performance = {
+      overall: this.summarize_user_performance(recent_user_overall_duels),
+      market: this.summarize_user_performance(recent_user_market_duels)
+    };
 
     const ai_decision = await this.ai_decision.decide_side({
       wallet: input.wallet,
       market: market_item,
       round: round_document,
+      player_side: input.player_side,
+      amount_lamports: input.amount_lamports,
+      recent_user_performance,
       recent_resolved_rounds
     });
 
     const ai_side = ai_decision.side;
+    const turn_index = 0;
     const nonce = randomBytes(32);
     const ai_commitment = this.build_ai_commitment({
       duel_id,
+      turn_index,
       player_wallet: input.wallet,
       market_pda: round_document.market_pda,
       round_pda: round_document.round_pda,
+      player_side: input.player_side,
+      amount_lamports: input.amount_lamports,
       ai_side,
       nonce
     });
@@ -230,6 +281,20 @@ export class ai_duels_service {
 
     const duel_record_id = `${round_document.id}:${input.wallet}:${duel_id}`;
     const now = Date.now();
+    const pending_turn: ai_duel_turn_document = {
+      turn_index,
+      player_side: input.player_side,
+      ai_side,
+      amount_lamports: input.amount_lamports,
+      ai_decision_model: ai_decision.model,
+      ai_decision_confidence: ai_decision.confidence,
+      ai_decision_rationale: ai_decision.rationale,
+      ai_nonce_base64: nonce.toString("base64"),
+      ai_commitment_base64: Buffer.from(ai_commitment).toString("base64"),
+      status: "prepared",
+      tx_signature: null,
+      created_at_ms: now
+    };
 
     await this.mongo.ai_duels_collection.updateOne(
       { id: duel_record_id },
@@ -245,14 +310,17 @@ export class ai_duels_service {
           duel_id,
           ai_duel_pda: prepared.ai_duel_pda,
           house_bankroll_pda: initialized.house_bankroll_pda,
+          amount_lamports: input.amount_lamports,
+          turn_count: 0,
+          turns: [],
+          pending_turn,
           player_side: input.player_side,
           ai_side,
           ai_decision_model: ai_decision.model,
           ai_decision_confidence: ai_decision.confidence,
           ai_decision_rationale: ai_decision.rationale,
-          ai_nonce_base64: nonce.toString("base64"),
-          ai_commitment_base64: Buffer.from(ai_commitment).toString("base64"),
-          amount_lamports: input.amount_lamports,
+          ai_nonce_base64: pending_turn.ai_nonce_base64,
+          ai_commitment_base64: pending_turn.ai_commitment_base64,
           status: "prepared",
           outcome: null,
           player_payout_lamports: null,
@@ -295,11 +363,17 @@ export class ai_duels_service {
     if (duel_document.player_wallet !== input.wallet) {
       throw new app_error("unauthorized", 403);
     }
-    if (duel_document.status === "open") {
+    const existing_turns = duel_document.turns ?? [];
+    if (duel_document.status === "open" && !duel_document.pending_turn && existing_turns.length > 0) {
       return this.get_by_id(duel_document.id);
     }
-    if (duel_document.status !== "prepared") {
-      throw new app_error("ai duel is not in prepared state", 409);
+    if (duel_document.status !== "prepared" && duel_document.status !== "open") {
+      throw new app_error("ai duel is not waiting for open confirmation", 409);
+    }
+
+    const pending_turn = duel_document.pending_turn;
+    if (!pending_turn || pending_turn.status !== "prepared" || pending_turn.turn_index !== 0) {
+      throw new app_error("duel has no prepared opening turn", 409);
     }
 
     await this.chain_admin.verify_open_ai_duel_transaction({
@@ -310,10 +384,18 @@ export class ai_duels_service {
       expected_house_bankroll_pda: duel_document.house_bankroll_pda,
       expected_ai_duel_pda: duel_document.ai_duel_pda,
       expected_duel_id: Number(duel_document.duel_id),
-      expected_player_side: duel_document.player_side,
-      expected_amount_lamports: Number(duel_document.amount_lamports),
-      expected_ai_commitment: Buffer.from(duel_document.ai_commitment_base64, "base64")
+      expected_player_side: pending_turn.player_side,
+      expected_amount_lamports: Number(pending_turn.amount_lamports),
+      expected_ai_commitment: Buffer.from(pending_turn.ai_commitment_base64, "base64")
     });
+
+    const confirmed_turn: ai_duel_turn_document = {
+      ...pending_turn,
+      status: "open",
+      tx_signature: input.tx_signature
+    };
+    const turns = [...existing_turns, confirmed_turn];
+    const now = Date.now();
 
     await this.mongo.ai_duels_collection.updateOne(
       { id: duel_document.id },
@@ -321,6 +403,271 @@ export class ai_duels_service {
         $set: {
           status: "open",
           open_tx_signature: input.tx_signature,
+          pending_turn: null,
+          turns,
+          turn_count: turns.length,
+          player_side: confirmed_turn.player_side,
+          ai_side: confirmed_turn.ai_side,
+          ai_decision_model: confirmed_turn.ai_decision_model ?? null,
+          ai_decision_confidence:
+            confirmed_turn.ai_decision_confidence === undefined
+              ? null
+              : confirmed_turn.ai_decision_confidence,
+          ai_decision_rationale: confirmed_turn.ai_decision_rationale ?? null,
+          ai_nonce_base64: confirmed_turn.ai_nonce_base64,
+          ai_commitment_base64: confirmed_turn.ai_commitment_base64,
+          updated_at_ms: now
+        }
+      }
+    );
+
+    return this.get_by_id(duel_document.id);
+  }
+
+  async prepare_append_turn_relay(input: {
+    duel_record_id: string;
+    wallet: string;
+    player_side: decision_side;
+    amount_lamports: number;
+  }): Promise<{
+    transaction_base64: string;
+    blockhash: string;
+    last_valid_block_height: number;
+    fee_payer: string;
+    market_pda: string;
+    round_pda: string;
+    house_bankroll_pda: string;
+    ai_duel_pda: string;
+    turn_index: number;
+  }> {
+    await this.mongo.ensure_ready();
+
+    if (input.player_side !== "yes" && input.player_side !== "no") {
+      throw new app_error("playerSide must be yes or no", 400);
+    }
+    if (!Number.isInteger(input.amount_lamports) || input.amount_lamports <= 0) {
+      throw new app_error("amountLamports must be a positive integer", 400);
+    }
+    if (input.amount_lamports > env.AI_DUEL_MAX_STAKE_LAMPORTS) {
+      throw new app_error(
+        `amountLamports exceeds cap of ${env.AI_DUEL_MAX_STAKE_LAMPORTS}`,
+        400
+      );
+    }
+
+    await this.expire_stale_prepared_duels();
+
+    const duel_document = await this.get_duel_or_throw(input.duel_record_id);
+    if (duel_document.player_wallet !== input.wallet) {
+      throw new app_error("unauthorized", 403);
+    }
+    if (duel_document.status !== "open") {
+      throw new app_error("ai duel is not open", 409);
+    }
+    if (duel_document.pending_turn) {
+      throw new app_error("ai duel has a pending turn awaiting confirmation", 409);
+    }
+
+    const turns = duel_document.turns ?? [];
+    if (turns.length <= 0) {
+      throw new app_error("duel has no confirmed opening turn", 409);
+    }
+    if (turns.length >= env.AI_DUEL_MAX_TURNS_PER_DUEL) {
+      throw new app_error(
+        `duel turn cap exceeded (${turns.length} >= ${env.AI_DUEL_MAX_TURNS_PER_DUEL})`,
+        409
+      );
+    }
+
+    const round_document = await this.mongo.rounds_collection.findOne({ id: duel_document.round_id });
+    if (!round_document) {
+      throw new app_error("round not found for ai duel", 404);
+    }
+    if (round_document.status !== "predicting") {
+      throw new app_error("round is not open for ai duel", 409);
+    }
+    if (Date.now() >= Number(round_document.close_at_ms)) {
+      throw new app_error("round is closed", 409);
+    }
+
+    const market_item = await this.get_market_or_throw(duel_document.market_slug);
+    await this.ensure_round_delegated(market_item.market_index, Number(duel_document.round_number));
+    await this.assert_open_exposure_limits({
+      wallet: input.wallet,
+      market_slug: market_item.slug,
+      round_id: round_document.id,
+      additional_amount_lamports: input.amount_lamports,
+      increment_open_duel_count: false
+    });
+
+    const [recent_resolved_rounds, recent_user_overall_duels, recent_user_market_duels] = await Promise.all([
+      this.mongo.rounds_collection
+        .find({
+          market_slug: market_item.slug,
+          status: "resolved",
+          settlement_price: { $ne: null }
+        })
+        .sort({ close_at_ms: -1 })
+        .limit(recent_market_rounds_limit)
+        .toArray(),
+      this.mongo.ai_duels_collection
+        .find({
+          player_wallet: input.wallet,
+          status: "settled",
+          outcome: { $in: ["player_win", "house_win", "push"] }
+        })
+        .sort({ created_at_ms: -1 })
+        .limit(recent_user_overall_duels_limit)
+        .toArray(),
+      this.mongo.ai_duels_collection
+        .find({
+          player_wallet: input.wallet,
+          market_slug: market_item.slug,
+          status: "settled",
+          outcome: { $in: ["player_win", "house_win", "push"] }
+        })
+        .sort({ created_at_ms: -1 })
+        .limit(recent_user_market_duels_limit)
+        .toArray()
+    ]);
+
+    const recent_user_performance = {
+      overall: this.summarize_user_performance(recent_user_overall_duels),
+      market: this.summarize_user_performance(recent_user_market_duels)
+    };
+
+    const ai_decision = await this.ai_decision.decide_side({
+      wallet: input.wallet,
+      market: market_item,
+      round: round_document,
+      player_side: input.player_side,
+      amount_lamports: input.amount_lamports,
+      recent_user_performance,
+      recent_resolved_rounds
+    });
+
+    const turn_index = turns.length;
+    const nonce = randomBytes(32);
+    const ai_commitment = this.build_ai_commitment({
+      duel_id: Number(duel_document.duel_id),
+      turn_index,
+      player_wallet: duel_document.player_wallet,
+      market_pda: duel_document.market_pda,
+      round_pda: duel_document.round_pda,
+      player_side: input.player_side,
+      amount_lamports: input.amount_lamports,
+      ai_side: ai_decision.side,
+      nonce
+    });
+
+    const prepared = await this.chain_admin.prepare_append_ai_duel_turn_transaction({
+      user_wallet: input.wallet,
+      market_index: market_item.market_index,
+      round_number: Number(duel_document.round_number),
+      duel_id: Number(duel_document.duel_id),
+      player_side: input.player_side,
+      amount_lamports: input.amount_lamports,
+      ai_commitment
+    });
+
+    const pending_turn: ai_duel_turn_document = {
+      turn_index,
+      player_side: input.player_side,
+      ai_side: ai_decision.side,
+      amount_lamports: input.amount_lamports,
+      ai_decision_model: ai_decision.model,
+      ai_decision_confidence: ai_decision.confidence,
+      ai_decision_rationale: ai_decision.rationale,
+      ai_nonce_base64: nonce.toString("base64"),
+      ai_commitment_base64: Buffer.from(ai_commitment).toString("base64"),
+      status: "prepared",
+      tx_signature: null,
+      created_at_ms: Date.now()
+    };
+
+    const current_total_amount = Number(duel_document.amount_lamports ?? 0);
+    await this.mongo.ai_duels_collection.updateOne(
+      { id: duel_document.id },
+      {
+        $set: {
+          pending_turn,
+          amount_lamports: current_total_amount + input.amount_lamports,
+          turn_count: turns.length,
+          updated_at_ms: Date.now()
+        }
+      }
+    );
+
+    return {
+      transaction_base64: prepared.transaction_base64,
+      blockhash: prepared.blockhash,
+      last_valid_block_height: prepared.last_valid_block_height,
+      fee_payer: prepared.fee_payer,
+      market_pda: prepared.market_pda,
+      round_pda: prepared.round_pda,
+      house_bankroll_pda: prepared.house_bankroll_pda,
+      ai_duel_pda: prepared.ai_duel_pda,
+      turn_index
+    };
+  }
+
+  async confirm_append_turn(input: {
+    duel_record_id: string;
+    wallet: string;
+    tx_signature: string;
+  }): Promise<ai_duel_view> {
+    await this.mongo.ensure_ready();
+
+    const duel_document = await this.get_duel_or_throw(input.duel_record_id);
+    if (duel_document.player_wallet !== input.wallet) {
+      throw new app_error("unauthorized", 403);
+    }
+    if (duel_document.status !== "open") {
+      throw new app_error("ai duel is not open", 409);
+    }
+
+    const pending_turn = duel_document.pending_turn;
+    if (!pending_turn || pending_turn.status !== "prepared") {
+      return this.get_by_id(duel_document.id);
+    }
+
+    await this.chain_admin.verify_append_ai_duel_turn_transaction({
+      tx_signature: input.tx_signature,
+      expected_wallet: input.wallet,
+      expected_market_pda: duel_document.market_pda,
+      expected_round_pda: duel_document.round_pda,
+      expected_house_bankroll_pda: duel_document.house_bankroll_pda,
+      expected_ai_duel_pda: duel_document.ai_duel_pda,
+      expected_duel_id: Number(duel_document.duel_id),
+      expected_player_side: pending_turn.player_side,
+      expected_amount_lamports: Number(pending_turn.amount_lamports),
+      expected_ai_commitment: Buffer.from(pending_turn.ai_commitment_base64, "base64")
+    });
+
+    const confirmed_turn: ai_duel_turn_document = {
+      ...pending_turn,
+      status: "open",
+      tx_signature: input.tx_signature
+    };
+    const turns: ai_duel_turn_document[] = [...(duel_document.turns ?? []), confirmed_turn];
+
+    await this.mongo.ai_duels_collection.updateOne(
+      { id: duel_document.id },
+      {
+        $set: {
+          pending_turn: null,
+          turns,
+          turn_count: turns.length,
+          player_side: pending_turn.player_side,
+          ai_side: pending_turn.ai_side,
+          ai_decision_model: pending_turn.ai_decision_model ?? null,
+          ai_decision_confidence:
+            pending_turn.ai_decision_confidence === undefined
+              ? null
+              : pending_turn.ai_decision_confidence,
+          ai_decision_rationale: pending_turn.ai_decision_rationale ?? null,
+          ai_nonce_base64: pending_turn.ai_nonce_base64,
+          ai_commitment_base64: pending_turn.ai_commitment_base64,
           updated_at_ms: Date.now()
         }
       }
@@ -342,6 +689,14 @@ export class ai_duels_service {
     }
     if (duel_document.status !== "open" && duel_document.status !== "revealed") {
       throw new app_error("ai duel is not open", 409);
+    }
+    if (duel_document.pending_turn) {
+      throw new app_error("ai duel has a pending turn awaiting confirmation", 409);
+    }
+
+    const turns = this.get_confirmed_turns(duel_document);
+    if (turns.length <= 0) {
+      throw new app_error("ai duel has no confirmed turns", 409);
     }
 
     const market_item = await this.get_market_or_throw(duel_document.market_slug);
@@ -373,32 +728,23 @@ export class ai_duels_service {
       admin: this.chain_admin.get_admin_public_key()
     });
 
-    const ai_side = duel_document.ai_side;
-    const nonce = Buffer.from(duel_document.ai_nonce_base64, "base64");
-
-    let reveal_tx_signature = duel_document.reveal_tx_signature;
-    if (!reveal_tx_signature) {
-      reveal_tx_signature = await this.chain_admin.reveal_ai_duel({
-        market_index: market_item.market_index,
-        player_wallet: duel_document.player_wallet,
-        duel_id: Number(duel_document.duel_id),
-        ai_side,
-        nonce
-      });
-    }
-
     const settle_tx_signature = await this.chain_admin.settle_ai_duel({
       market_index: market_item.market_index,
       player_wallet: duel_document.player_wallet,
       duel_id: Number(duel_document.duel_id),
-      round_number: Number(duel_document.round_number)
+      round_number: Number(duel_document.round_number),
+      ai_sides: turns.map((turn) => turn.ai_side),
+      nonces: turns.map((turn) => Buffer.from(turn.ai_nonce_base64, "base64"))
     });
 
+    const total_amount_lamports = turns.reduce(
+      (sum, turn) => sum + Number(turn.amount_lamports),
+      0
+    );
     const resolved = this.resolve_duel_outcome({
-      player_side: duel_document.player_side,
-      ai_side,
+      turns,
       winning_side,
-      amount_lamports: Number(duel_document.amount_lamports)
+      total_amount_lamports
     });
 
     await this.mongo.ai_duels_collection.updateOne(
@@ -408,8 +754,11 @@ export class ai_duels_service {
           status: "settled",
           outcome: resolved.outcome,
           player_payout_lamports: resolved.player_payout_lamports,
-          reveal_tx_signature,
+          reveal_tx_signature: duel_document.reveal_tx_signature ?? null,
           settle_tx_signature,
+          pending_turn: null,
+          turn_count: turns.length,
+          amount_lamports: total_amount_lamports,
           updated_at_ms: Date.now()
         }
       }
@@ -489,15 +838,23 @@ export class ai_duels_service {
 
   private build_ai_commitment(input: {
     duel_id: number;
+    turn_index: number;
     player_wallet: string;
     market_pda: string;
     round_pda: string;
+    player_side: decision_side;
+    amount_lamports: number;
     ai_side: decision_side;
     nonce: Buffer;
   }): Buffer {
     const duel_id_le = Buffer.alloc(8);
     duel_id_le.writeBigUInt64LE(BigInt(input.duel_id), 0);
+    const turn_index_le = Buffer.alloc(2);
+    turn_index_le.writeUInt16LE(input.turn_index & 0xffff, 0);
 
+    const player_side = Buffer.from([this.side_to_raw(input.player_side)]);
+    const amount_lamports_le = Buffer.alloc(8);
+    amount_lamports_le.writeBigUInt64LE(BigInt(input.amount_lamports), 0);
     const side = Buffer.from([this.side_to_raw(input.ai_side)]);
 
     return createHash("sha256")
@@ -506,41 +863,68 @@ export class ai_duels_service {
       .update(new PublicKey(input.player_wallet).toBuffer())
       .update(new PublicKey(input.market_pda).toBuffer())
       .update(new PublicKey(input.round_pda).toBuffer())
+      .update(turn_index_le)
+      .update(player_side)
+      .update(amount_lamports_le)
       .update(side)
       .update(input.nonce)
       .digest();
   }
 
   private resolve_duel_outcome(input: {
-    player_side: decision_side;
-    ai_side: decision_side;
+    turns: ai_duel_turn_document[];
     winning_side: decision_side;
-    amount_lamports: number;
+    total_amount_lamports: number;
   }): {
     outcome: ai_duel_outcome;
     player_payout_lamports: number;
   } {
-    const player_correct = input.player_side === input.winning_side;
-    const ai_correct = input.ai_side === input.winning_side;
+    let player_payout_lamports = 0;
+    for (const turn of input.turns) {
+      player_payout_lamports += this.resolve_duel_turn_player_payout_lamports({
+        player_side: turn.player_side,
+        ai_side: turn.ai_side,
+        winning_side: input.winning_side,
+        amount_lamports: Number(turn.amount_lamports)
+      });
+    }
 
-    if (player_correct && !ai_correct) {
+    if (player_payout_lamports > input.total_amount_lamports) {
       return {
         outcome: "player_win",
-        player_payout_lamports: input.amount_lamports * 2
+        player_payout_lamports
       };
     }
 
-    if (ai_correct && !player_correct) {
+    if (player_payout_lamports < input.total_amount_lamports) {
       return {
         outcome: "house_win",
-        player_payout_lamports: 0
+        player_payout_lamports
       };
     }
 
     return {
       outcome: "push",
-      player_payout_lamports: input.amount_lamports
+      player_payout_lamports
     };
+  }
+
+  private resolve_duel_turn_player_payout_lamports(input: {
+    player_side: decision_side;
+    ai_side: decision_side;
+    winning_side: decision_side;
+    amount_lamports: number;
+  }): number {
+    const player_correct = input.player_side === input.winning_side;
+    const ai_correct = input.ai_side === input.winning_side;
+
+    if (player_correct && !ai_correct) {
+      return input.amount_lamports * 2;
+    }
+    if (ai_correct && !player_correct) {
+      return 0;
+    }
+    return input.amount_lamports;
   }
 
   private side_to_raw(side: decision_side): number {
@@ -551,6 +935,268 @@ export class ai_duels_service {
       return 1;
     }
     return 2;
+  }
+
+  private summarize_user_performance(rows: ai_duel_document[]): ai_user_performance_summary {
+    if (rows.length === 0) {
+      return {
+        sample_size: 0,
+        player_wins: 0,
+        house_wins: 0,
+        pushes: 0,
+        player_win_rate_ex_push: null,
+        avg_stake_lamports: null,
+        avg_player_roi_pct: null,
+        recent_outcomes: []
+      };
+    }
+
+    let player_wins = 0;
+    let house_wins = 0;
+    let pushes = 0;
+    let total_stake = 0;
+    let total_roi_pct = 0;
+    let roi_count = 0;
+
+    for (const row of rows) {
+      if (row.outcome === "player_win") {
+        player_wins += 1;
+      } else if (row.outcome === "house_win") {
+        house_wins += 1;
+      } else if (row.outcome === "push") {
+        pushes += 1;
+      }
+
+      const amount = Number(row.amount_lamports);
+      total_stake += amount;
+
+      const payout = row.player_payout_lamports === null ? null : Number(row.player_payout_lamports);
+      if (amount > 0 && payout !== null) {
+        total_roi_pct += ((payout - amount) / amount) * 100;
+        roi_count += 1;
+      }
+    }
+
+    const decisive = player_wins + house_wins;
+    const recent_outcomes = rows
+      .slice(0, 6)
+      .map((row) => row.outcome)
+      .filter((outcome): outcome is "player_win" | "house_win" | "push" => outcome !== null);
+
+    return {
+      sample_size: rows.length,
+      player_wins,
+      house_wins,
+      pushes,
+      player_win_rate_ex_push: decisive > 0 ? player_wins / decisive : null,
+      avg_stake_lamports: total_stake / rows.length,
+      avg_player_roi_pct: roi_count > 0 ? total_roi_pct / roi_count : null,
+      recent_outcomes
+    };
+  }
+
+  private async assert_open_exposure_limits(input: {
+    wallet: string;
+    market_slug: string;
+    round_id: string;
+    additional_amount_lamports: number;
+    increment_open_duel_count: boolean;
+  }): Promise<void> {
+    const [
+      overall_exposure_rows,
+      wallet_exposure_rows,
+      market_exposure_rows,
+      round_exposure_rows,
+      total_open_duels_count,
+      wallet_open_duels_count,
+      bankroll_balance_lamports
+    ] = await Promise.all([
+      this.mongo.ai_duels_collection
+        .aggregate<{ total_exposure_lamports: number }>([
+          {
+            $match: {
+              status: { $in: active_duel_statuses }
+            }
+          },
+          {
+            $group: {
+              _id: null,
+              total_exposure_lamports: { $sum: "$amount_lamports" }
+            }
+          }
+        ])
+        .toArray(),
+      this.mongo.ai_duels_collection
+        .aggregate<{ wallet_exposure_lamports: number }>([
+          {
+            $match: {
+              status: { $in: active_duel_statuses },
+              player_wallet: input.wallet
+            }
+          },
+          {
+            $group: {
+              _id: null,
+              wallet_exposure_lamports: { $sum: "$amount_lamports" }
+            }
+          }
+        ])
+        .toArray(),
+      this.mongo.ai_duels_collection
+        .aggregate<{ market_exposure_lamports: number }>([
+          {
+            $match: {
+              status: { $in: active_duel_statuses },
+              market_slug: input.market_slug
+            }
+          },
+          {
+            $group: {
+              _id: null,
+              market_exposure_lamports: { $sum: "$amount_lamports" }
+            }
+          }
+        ])
+        .toArray(),
+      this.mongo.ai_duels_collection
+        .aggregate<{ round_exposure_lamports: number }>([
+          {
+            $match: {
+              status: { $in: active_duel_statuses },
+              round_id: input.round_id
+            }
+          },
+          {
+            $group: {
+              _id: null,
+              round_exposure_lamports: { $sum: "$amount_lamports" }
+            }
+          }
+        ])
+        .toArray(),
+      this.mongo.ai_duels_collection.countDocuments({
+        status: { $in: active_duel_statuses }
+      }),
+      this.mongo.ai_duels_collection.countDocuments({
+        status: { $in: active_duel_statuses },
+        player_wallet: input.wallet
+      }),
+      this.chain_admin.get_house_bankroll_balance_lamports()
+    ]);
+
+    const total_open_exposure_lamports = Number(overall_exposure_rows[0]?.total_exposure_lamports ?? 0);
+    const wallet_open_exposure_lamports = Number(wallet_exposure_rows[0]?.wallet_exposure_lamports ?? 0);
+    const market_open_exposure_lamports = Number(market_exposure_rows[0]?.market_exposure_lamports ?? 0);
+    const round_open_exposure_lamports = Number(round_exposure_rows[0]?.round_exposure_lamports ?? 0);
+    const projected_total_open_exposure_lamports = total_open_exposure_lamports + input.additional_amount_lamports;
+    const projected_wallet_open_exposure_lamports = wallet_open_exposure_lamports + input.additional_amount_lamports;
+    const projected_market_open_exposure_lamports = market_open_exposure_lamports + input.additional_amount_lamports;
+    const projected_round_open_exposure_lamports = round_open_exposure_lamports + input.additional_amount_lamports;
+    const duel_count_increment = input.increment_open_duel_count ? 1 : 0;
+    const projected_total_open_duels_count = total_open_duels_count + duel_count_increment;
+    const projected_wallet_open_duels_count = wallet_open_duels_count + duel_count_increment;
+
+    if (projected_total_open_exposure_lamports > env.AI_DUEL_MAX_TOTAL_OPEN_EXPOSURE_LAMPORTS) {
+      throw new app_error(
+        `platform open exposure cap exceeded (${projected_total_open_exposure_lamports} > ${env.AI_DUEL_MAX_TOTAL_OPEN_EXPOSURE_LAMPORTS})`,
+        409
+      );
+    }
+
+    if (projected_market_open_exposure_lamports > env.AI_DUEL_MAX_MARKET_OPEN_EXPOSURE_LAMPORTS) {
+      throw new app_error(
+        `market open exposure cap exceeded (${projected_market_open_exposure_lamports} > ${env.AI_DUEL_MAX_MARKET_OPEN_EXPOSURE_LAMPORTS})`,
+        409
+      );
+    }
+
+    if (projected_round_open_exposure_lamports > env.AI_DUEL_MAX_ROUND_OPEN_EXPOSURE_LAMPORTS) {
+      throw new app_error(
+        `round open exposure cap exceeded (${projected_round_open_exposure_lamports} > ${env.AI_DUEL_MAX_ROUND_OPEN_EXPOSURE_LAMPORTS})`,
+        409
+      );
+    }
+
+    if (projected_wallet_open_exposure_lamports > env.AI_DUEL_MAX_WALLET_OPEN_EXPOSURE_LAMPORTS) {
+      throw new app_error(
+        `wallet open exposure cap exceeded (${projected_wallet_open_exposure_lamports} > ${env.AI_DUEL_MAX_WALLET_OPEN_EXPOSURE_LAMPORTS})`,
+        409
+      );
+    }
+
+    if (projected_total_open_duels_count > env.AI_DUEL_MAX_OPEN_DUELS_COUNT) {
+      throw new app_error(
+        `global open duel count cap exceeded (${projected_total_open_duels_count} > ${env.AI_DUEL_MAX_OPEN_DUELS_COUNT})`,
+        409
+      );
+    }
+
+    if (projected_wallet_open_duels_count > env.AI_DUEL_MAX_WALLET_OPEN_DUELS_COUNT) {
+      throw new app_error(
+        `wallet open duel count cap exceeded (${projected_wallet_open_duels_count} > ${env.AI_DUEL_MAX_WALLET_OPEN_DUELS_COUNT})`,
+        409
+      );
+    }
+
+    const required_bankroll_lamports = Math.ceil(
+      (projected_total_open_exposure_lamports * env.AI_DUEL_REQUIRED_BANKROLL_COVERAGE_BPS) / 10_000
+    );
+    if (bankroll_balance_lamports < required_bankroll_lamports) {
+      throw new app_error(
+        `insufficient bankroll coverage (${bankroll_balance_lamports} < ${required_bankroll_lamports})`,
+        409
+      );
+    }
+  }
+
+  private async expire_stale_prepared_duels(): Promise<void> {
+    const now_ms = Date.now();
+    const cutoff_ms = now_ms - env.AI_DUEL_PREPARED_TTL_SECONDS * 1000;
+    await this.mongo.ai_duels_collection.updateMany(
+      {
+        status: "prepared",
+        created_at_ms: { $lte: cutoff_ms }
+      },
+      {
+        $set: {
+          status: "cancelled",
+          updated_at_ms: now_ms
+        }
+      }
+    );
+
+    const stale_pending_turn_duels = await this.mongo.ai_duels_collection
+      .find({
+        status: "open",
+        pending_turn: { $ne: null },
+        "pending_turn.status": "prepared",
+        "pending_turn.created_at_ms": { $lte: cutoff_ms }
+      })
+      .limit(200)
+      .toArray();
+
+    for (const duel_document of stale_pending_turn_duels) {
+      const pending_turn = duel_document.pending_turn;
+      if (!pending_turn) {
+        continue;
+      }
+
+      const next_total_amount_lamports = Math.max(
+        0,
+        Number(duel_document.amount_lamports ?? 0) - Number(pending_turn.amount_lamports ?? 0)
+      );
+
+      await this.mongo.ai_duels_collection.updateOne(
+        { id: duel_document.id },
+        {
+          $set: {
+            pending_turn: null,
+            amount_lamports: next_total_amount_lamports,
+            updated_at_ms: now_ms
+          }
+        }
+      );
+    }
   }
 
   private async allocate_duel_id(market_slug: string, wallet: string): Promise<number> {
@@ -665,7 +1311,67 @@ export class ai_duels_service {
     return views;
   }
 
+  private get_confirmed_turns(duel_document: ai_duel_document): ai_duel_turn_document[] {
+    const turns = Array.isArray(duel_document.turns) ? duel_document.turns : [];
+    if (turns.length > 0) {
+      return [...turns].sort((a, b) => Number(a.turn_index) - Number(b.turn_index));
+    }
+
+    if (
+      duel_document.player_side &&
+      duel_document.ai_side &&
+      duel_document.ai_nonce_base64 &&
+      duel_document.ai_commitment_base64 &&
+      Number(duel_document.amount_lamports) > 0
+    ) {
+      return [
+        {
+          turn_index: 0,
+          player_side: duel_document.player_side,
+          ai_side: duel_document.ai_side,
+          amount_lamports: Number(duel_document.amount_lamports),
+          ai_decision_model: duel_document.ai_decision_model ?? null,
+          ai_decision_confidence: duel_document.ai_decision_confidence ?? null,
+          ai_decision_rationale: duel_document.ai_decision_rationale ?? null,
+          ai_nonce_base64: duel_document.ai_nonce_base64,
+          ai_commitment_base64: duel_document.ai_commitment_base64,
+          status: duel_document.status === "prepared" ? "prepared" : "open",
+          tx_signature: duel_document.open_tx_signature,
+          created_at_ms: Number(duel_document.created_at_ms)
+        }
+      ];
+    }
+
+    return [];
+  }
+
+  private to_turn_view(turn: ai_duel_turn_document): ai_duel_turn_view {
+    return {
+      turnIndex: Number(turn.turn_index),
+      playerSide: turn.player_side,
+      aiSide: turn.ai_side,
+      amountLamports: Number(turn.amount_lamports),
+      aiDecisionModel: turn.ai_decision_model ?? null,
+      aiDecisionConfidence:
+        turn.ai_decision_confidence === undefined || turn.ai_decision_confidence === null
+          ? null
+          : Number(turn.ai_decision_confidence),
+      aiDecisionRationale: turn.ai_decision_rationale ?? null,
+      status: turn.status,
+      txSignature: turn.tx_signature ?? null,
+      createdAtMs: Number(turn.created_at_ms)
+    };
+  }
+
   private to_view(duel_document: ai_duel_document, market_item: market): ai_duel_view {
+    const turns = this.get_confirmed_turns(duel_document);
+    const pending_turn = duel_document.pending_turn ?? null;
+    const latest_turn = pending_turn ?? turns[turns.length - 1] ?? null;
+    const latest_confidence =
+      latest_turn?.ai_decision_confidence !== undefined
+        ? latest_turn.ai_decision_confidence
+        : duel_document.ai_decision_confidence;
+
     return {
       id: duel_document.id,
       market: market_item,
@@ -677,15 +1383,17 @@ export class ai_duels_service {
       duelId: Number(duel_document.duel_id),
       aiDuelPda: duel_document.ai_duel_pda,
       houseBankrollPda: duel_document.house_bankroll_pda,
-      playerSide: duel_document.player_side,
-      aiSide: duel_document.ai_side,
-      aiDecisionModel: duel_document.ai_decision_model ?? null,
+      playerSide: latest_turn?.player_side ?? duel_document.player_side ?? "yes",
+      aiSide: latest_turn?.ai_side ?? duel_document.ai_side ?? "no",
+      aiDecisionModel: latest_turn?.ai_decision_model ?? duel_document.ai_decision_model ?? null,
       aiDecisionConfidence:
-        duel_document.ai_decision_confidence === undefined || duel_document.ai_decision_confidence === null
-          ? null
-          : Number(duel_document.ai_decision_confidence),
-      aiDecisionRationale: duel_document.ai_decision_rationale ?? null,
+        latest_confidence === undefined || latest_confidence === null ? null : Number(latest_confidence),
+      aiDecisionRationale: latest_turn?.ai_decision_rationale ?? duel_document.ai_decision_rationale ?? null,
       amountLamports: Number(duel_document.amount_lamports),
+      turnCount: turns.length,
+      totalAmountLamports: Number(duel_document.amount_lamports),
+      pendingTurn: pending_turn ? this.to_turn_view(pending_turn) : null,
+      turns: turns.map((turn) => this.to_turn_view(turn)),
       status: duel_document.status,
       outcome: duel_document.outcome,
       playerPayoutLamports:

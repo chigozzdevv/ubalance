@@ -102,6 +102,21 @@ export type match_entry_document = {
   updated_at_ms: number;
 };
 
+export type ai_duel_turn_document = {
+  turn_index: number;
+  player_side: "yes" | "no" | "skip";
+  ai_side: "yes" | "no" | "skip";
+  amount_lamports: number;
+  ai_decision_model?: string | null;
+  ai_decision_confidence?: number | null;
+  ai_decision_rationale?: string | null;
+  ai_nonce_base64: string;
+  ai_commitment_base64: string;
+  status: "prepared" | "open";
+  tx_signature: string | null;
+  created_at_ms: number;
+};
+
 export type ai_duel_document = {
   _id: string;
   id: string;
@@ -114,14 +129,17 @@ export type ai_duel_document = {
   duel_id: number;
   ai_duel_pda: string;
   house_bankroll_pda: string;
-  player_side: "yes" | "no" | "skip";
-  ai_side: "yes" | "no" | "skip";
+  player_side?: "yes" | "no" | "skip";
+  ai_side?: "yes" | "no" | "skip";
   ai_decision_model?: string | null;
   ai_decision_confidence?: number | null;
   ai_decision_rationale?: string | null;
-  ai_nonce_base64: string;
-  ai_commitment_base64: string;
+  ai_nonce_base64?: string;
+  ai_commitment_base64?: string;
   amount_lamports: number;
+  turn_count?: number;
+  turns?: ai_duel_turn_document[];
+  pending_turn?: ai_duel_turn_document | null;
   status: "prepared" | "open" | "revealed" | "settled" | "cancelled";
   outcome: "player_win" | "house_win" | "push" | null;
   player_payout_lamports: number | null;
@@ -280,8 +298,16 @@ export class mongo_service {
       { name: "idx_ai_duels_round_status" }
     );
     await this.ai_duels_collection.createIndex(
+      { status: 1, market_slug: 1 },
+      { name: "idx_ai_duels_status_market" }
+    );
+    await this.ai_duels_collection.createIndex(
       { player_wallet: 1, status: 1, created_at_ms: -1 },
       { name: "idx_ai_duels_player_status_created" }
+    );
+    await this.ai_duels_collection.createIndex(
+      { status: 1, created_at_ms: 1 },
+      { name: "idx_ai_duels_status_created" }
     );
 
     await this.auth_challenges_collection.createIndex(

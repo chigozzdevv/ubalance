@@ -18,6 +18,11 @@ const open_duel_schema = z.object({
   amountLamports: z.coerce.number().int().positive()
 });
 
+const append_turn_schema = z.object({
+  playerSide: z.enum(["yes", "no"]),
+  amountLamports: z.coerce.number().int().positive()
+});
+
 const confirm_tx_schema = z.object({
   txSignature: z.string().min(20).max(128)
 });
@@ -193,6 +198,61 @@ export class ai_duels_controller {
       const duel_id = (request.params as any).duelId as string;
       const payload = confirm_tx_schema.parse(request.body ?? {});
       const updated = await this.service.confirm_open({
+        duel_record_id: duel_id,
+        wallet,
+        tx_signature: payload.txSignature
+      });
+
+      reply.send(ok(updated));
+    } catch (error: unknown) {
+      this.handle_error(error, reply);
+    }
+  };
+
+  prepare_append_turn_relay = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const wallet = request.auth_wallet;
+      if (!wallet) {
+        reply.code(401).send({ success: false, message: "unauthorized" });
+        return;
+      }
+
+      const duel_id = (request.params as any).duelId as string;
+      const payload = append_turn_schema.parse(request.body ?? {});
+      const prepared = await this.service.prepare_append_turn_relay({
+        duel_record_id: duel_id,
+        wallet,
+        player_side: payload.playerSide,
+        amount_lamports: payload.amountLamports
+      });
+
+      reply.send(ok({
+        turnIndex: prepared.turn_index,
+        transactionBase64: prepared.transaction_base64,
+        blockhash: prepared.blockhash,
+        lastValidBlockHeight: prepared.last_valid_block_height,
+        feePayer: prepared.fee_payer,
+        marketPda: prepared.market_pda,
+        roundPda: prepared.round_pda,
+        houseBankrollPda: prepared.house_bankroll_pda,
+        aiDuelPda: prepared.ai_duel_pda
+      }));
+    } catch (error: unknown) {
+      this.handle_error(error, reply);
+    }
+  };
+
+  confirm_append_turn = async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const wallet = request.auth_wallet;
+      if (!wallet) {
+        reply.code(401).send({ success: false, message: "unauthorized" });
+        return;
+      }
+
+      const duel_id = (request.params as any).duelId as string;
+      const payload = confirm_tx_schema.parse(request.body ?? {});
+      const updated = await this.service.confirm_append_turn({
         duel_record_id: duel_id,
         wallet,
         tx_signature: payload.txSignature

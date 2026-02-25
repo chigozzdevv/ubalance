@@ -47,6 +47,10 @@ export class oracle_service {
     return latest.price;
   }
 
+  async get_feed_id(oracle_symbol: string): Promise<string> {
+    return this.resolve_feed_id(normalize_symbol(oracle_symbol));
+  }
+
   async get_price_near_timestamp(oracle_symbol: string, timestamp_ms: number): Promise<number> {
     const normalized = normalize_symbol(oracle_symbol);
     const feed_id = await this.resolve_feed_id(normalized);

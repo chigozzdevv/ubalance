@@ -28,7 +28,11 @@ export const register_routes = async (fastify: FastifyInstance) => {
   const auth_service_instance = new auth_service(mongo_service_instance);
   const chain_admin_service_instance = new chain_admin_service();
   const oracle_service_instance = new oracle_service();
-  const markets_service_instance = new markets_service(mongo_service_instance, chain_admin_service_instance);
+  const markets_service_instance = new markets_service(
+    mongo_service_instance,
+    chain_admin_service_instance,
+    oracle_service_instance
+  );
   const rounds_service_instance = new rounds_service(
     mongo_service_instance,
     markets_service_instance,

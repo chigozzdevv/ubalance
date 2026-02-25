@@ -3,6 +3,7 @@ use anchor_lang::system_program::{transfer, Transfer};
 use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::{commit_accounts, commit_and_undelegate_accounts};
+use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 use solana_sha256_hasher::hashv;
 
 declare_id!("FkZVTshsawSNHYzxFZFfdBJUbLxvQJVhWtJqi8FgunFG");
@@ -12,9 +13,18 @@ const ROUND_SEED: &[u8] = b"round";
 const POSITION_SEED: &[u8] = b"position";
 const MATCH_SEED: &[u8] = b"match";
 const MATCH_ENTRY_SEED: &[u8] = b"match_entry";
+const MARKET_ORACLE_SEED: &[u8] = b"market_oracle";
 const HOUSE_BANKROLL_SEED: &[u8] = b"house_bankroll";
 const AI_DUEL_SEED: &[u8] = b"ai_duel";
 const AI_DUEL_COMMIT_DOMAIN: &[u8] = b"ubalance-ai-duel";
+const MAX_AI_DUEL_TURNS: usize = 32;
+const AI_DUEL_SIDE_UNSET: u8 = u8::MAX;
+const SETTLEMENT_PRICE_SCALE_EXPONENT: i32 = -5;
+const ORACLE_MAX_PRICE_AGE_SECONDS: u64 = 180;
+const ORACLE_MAX_PUBLISH_LAG_SECONDS: i64 = 180;
+const PROTOCOL_FEE_BPS: u64 = 250;
+const BPS_DENOMINATOR: u64 = 10_000;
+const MAX_MATCH_SCORING_ROUNDS: usize = 256;
 
 #[ephemeral]
 #[program]
@@ -44,6 +54,30 @@ pub mod ubalance_prediction_market {
         let market = &mut ctx.accounts.market;
         require_keys_eq!(market.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
         market.is_active = is_active;
+        Ok(())
+    }
+
+    pub fn init_market_oracle(
+        ctx: Context<InitMarketOracle>,
+        oracle_feed_id: [u8; 32],
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        require_keys_eq!(market.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
+
+        let market_oracle = &mut ctx.accounts.market_oracle;
+        let is_uninitialized = market_oracle.market == Pubkey::default();
+        if is_uninitialized {
+            market_oracle.market = market.key();
+            market_oracle.oracle_feed_id = oracle_feed_id;
+            market_oracle.created_at_ts = Clock::get()?.unix_timestamp;
+            return Ok(());
+        }
+
+        require_keys_eq!(market_oracle.market, market.key(), ErrorCode::InvalidMarketOracle);
+        require!(
+            market_oracle.oracle_feed_id == oracle_feed_id,
+            ErrorCode::MarketOracleAlreadyInitialized
+        );
         Ok(())
     }
 
@@ -146,11 +180,46 @@ pub mod ubalance_prediction_market {
         Ok(())
     }
 
-    pub fn resolve_round(ctx: Context<ResolveRound>, settlement_price: u64) -> Result<()> {
+    pub fn resolve_round(ctx: Context<ResolveRound>) -> Result<()> {
+        let clock = Clock::get()?;
         let market = &ctx.accounts.market;
+        let market_oracle = &ctx.accounts.market_oracle;
         let round = &mut ctx.accounts.round;
-        require_keys_eq!(market.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
+
         require!(round.status == RoundStatus::Locked as u8, ErrorCode::InvalidState);
+        require!(clock.unix_timestamp >= round.close_at_ts, ErrorCode::RoundNotClosedYet);
+        require_keys_eq!(market_oracle.market, market.key(), ErrorCode::InvalidMarketOracle);
+
+        let price = ctx
+            .accounts
+            .oracle_price_feed
+            .get_price_no_older_than(
+                &clock,
+                ORACLE_MAX_PRICE_AGE_SECONDS,
+                &market_oracle.oracle_feed_id,
+            )
+            .map_err(|_| error!(ErrorCode::OraclePriceUnavailable))?;
+        require!(
+            price.publish_time >= round.close_at_ts,
+            ErrorCode::OraclePublishBeforeRoundClose
+        );
+        require!(
+            price.publish_time <= round.close_at_ts.saturating_add(ORACLE_MAX_PUBLISH_LAG_SECONDS),
+            ErrorCode::OraclePublishTooLate
+        );
+
+        let total_pool = round.yes_total.saturating_add(round.no_total);
+        let protocol_fee_lamports = calculate_protocol_fee_lamports(total_pool)?;
+        if protocol_fee_lamports > 0 {
+            transfer_lamports_from_program_account(
+                &round.to_account_info(),
+                &ctx.accounts.platform_fee_receiver.to_account_info(),
+                protocol_fee_lamports,
+                8 + Round::LEN,
+            )?;
+        }
+
+        let settlement_price = normalize_oracle_price_to_internal_units(price.price, price.exponent)?;
 
         round.settlement_price = Some(settlement_price);
         round.status = RoundStatus::Resolved as u8;
@@ -189,8 +258,13 @@ pub mod ubalance_prediction_market {
         require!(winners_total > 0, ErrorCode::NoPayoutAvailable);
 
         let total_pool = round.yes_total.saturating_add(round.no_total);
+        let protocol_fee_lamports = calculate_protocol_fee_lamports(total_pool)?;
+        let distributable_pool = total_pool
+            .checked_sub(protocol_fee_lamports)
+            .ok_or(error!(ErrorCode::MathOverflow))?;
+        require!(distributable_pool > 0, ErrorCode::NoPayoutAvailable);
         let payout_u128 = (position.amount_lamports as u128)
-            .checked_mul(total_pool as u128)
+            .checked_mul(distributable_pool as u128)
             .ok_or(error!(ErrorCode::MathOverflow))?
             .checked_div(winners_total as u128)
             .ok_or(error!(ErrorCode::MathOverflow))?;
@@ -240,6 +314,7 @@ pub mod ubalance_prediction_market {
         match_account.pot_lamports = 0;
         match_account.winner_count = 0;
         match_account.highest_score = 0;
+        match_account.recorded_result_count = 0;
         match_account.created_at_ts = now_ts;
         match_account.finalized_at_ts = None;
         Ok(())
@@ -312,30 +387,110 @@ pub mod ubalance_prediction_market {
         Ok(())
     }
 
-    pub fn set_match_entry_result(
-        ctx: Context<SetMatchEntryResult>,
-        score: u16,
-        is_winner: bool,
-    ) -> Result<()> {
+    pub fn set_match_entry_result(ctx: Context<SetMatchEntryResult>) -> Result<()> {
+        let clock = Clock::get()?;
         let market = &ctx.accounts.market;
         let match_account = &mut ctx.accounts.match_account;
         let entry = &mut ctx.accounts.match_entry;
 
-        require_keys_eq!(market.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
-        require_keys_eq!(match_account.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
+        require_keys_eq!(match_account.market, market.key(), ErrorCode::InvalidMatchMarket);
         require!(match_account.status == MatchStatus::Locked as u8, ErrorCode::InvalidState);
+        require!(clock.unix_timestamp >= match_account.end_at_ts, ErrorCode::MatchNotEndedYet);
         require!(entry.joined, ErrorCode::MatchEntryNotJoined);
         require!(!entry.result_recorded, ErrorCode::MatchResultAlreadyRecorded);
+        require!(
+            match_account.recorded_result_count < match_account.player_count,
+            ErrorCode::MatchResultsComplete
+        );
+
+        let remaining_count = ctx.remaining_accounts.len();
+        require!(
+            remaining_count % 2 == 0,
+            ErrorCode::InvalidScoringAccounts
+        );
+        require!(
+            remaining_count / 2 <= MAX_MATCH_SCORING_ROUNDS,
+            ErrorCode::TooManyScoringRounds
+        );
+
+        let mut score: u16 = 0;
+        let mut seen_rounds: Vec<Pubkey> = Vec::with_capacity(remaining_count / 2);
+        let mut pair_index = 0usize;
+        while pair_index < remaining_count {
+            let round_info = &ctx.remaining_accounts[pair_index];
+            let position_info = &ctx.remaining_accounts[pair_index + 1];
+            pair_index += 2;
+
+            require_keys_eq!(*round_info.owner, crate::ID, ErrorCode::InvalidScoringAccounts);
+            require_keys_eq!(
+                *position_info.owner,
+                crate::ID,
+                ErrorCode::InvalidScoringAccounts
+            );
+            require!(
+                !seen_rounds.iter().any(|seen| seen == round_info.key),
+                ErrorCode::DuplicateScoringRound
+            );
+            seen_rounds.push(*round_info.key);
+
+            let round: Round = {
+                let data = round_info
+                    .try_borrow_data()
+                    .map_err(|_| error!(ErrorCode::InvalidScoringRound))?;
+                let mut data_slice: &[u8] = &data;
+                Round::try_deserialize(&mut data_slice)
+                    .map_err(|_| error!(ErrorCode::InvalidScoringRound))?
+            };
+            require_keys_eq!(round.market, market.key(), ErrorCode::InvalidScoringRound);
+            require!(
+                round.status == RoundStatus::Resolved as u8,
+                ErrorCode::InvalidScoringRound
+            );
+            require!(
+                round.close_at_ts >= match_account.start_at_ts
+                    && round.close_at_ts <= match_account.end_at_ts,
+                ErrorCode::InvalidScoringRound
+            );
+
+            let position: Position = {
+                let data = position_info
+                    .try_borrow_data()
+                    .map_err(|_| error!(ErrorCode::InvalidScoringPosition))?;
+                let mut data_slice: &[u8] = &data;
+                Position::try_deserialize(&mut data_slice)
+                    .map_err(|_| error!(ErrorCode::InvalidScoringPosition))?
+            };
+            require_keys_eq!(
+                position.round,
+                *round_info.key,
+                ErrorCode::InvalidScoringPosition
+            );
+            require_keys_eq!(position.user, entry.player, ErrorCode::InvalidScoringPosition);
+            if position.amount_lamports == 0 {
+                continue;
+            }
+
+            let resolved_side = round
+                .resolved_side
+                .clone()
+                .ok_or(error!(ErrorCode::RoundUnresolved))?;
+            if resolved_side == DecisionSide::Skip {
+                continue;
+            }
+            if position.side == resolved_side {
+                score = score.checked_add(1).ok_or(error!(ErrorCode::MathOverflow))?;
+            }
+        }
 
         entry.score = score;
-        entry.is_winner = is_winner;
+        entry.is_winner = false;
         entry.result_recorded = true;
-
-        if is_winner {
-            match_account.winner_count = match_account.winner_count.saturating_add(1);
-        }
+        match_account.recorded_result_count = match_account.recorded_result_count.saturating_add(1);
         if score > match_account.highest_score {
             match_account.highest_score = score;
+            match_account.winner_count = 1;
+        } else if score == match_account.highest_score {
+            match_account.winner_count = match_account.winner_count.saturating_add(1);
         }
 
         Ok(())
@@ -348,7 +503,21 @@ pub mod ubalance_prediction_market {
         require_keys_eq!(market.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
         require_keys_eq!(match_account.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
         require!(match_account.status == MatchStatus::Locked as u8, ErrorCode::InvalidState);
+        require!(
+            match_account.recorded_result_count == match_account.player_count,
+            ErrorCode::MatchResultsIncomplete
+        );
         require!(match_account.winner_count > 0, ErrorCode::NoWinnersRecorded);
+
+        let protocol_fee_lamports = calculate_protocol_fee_lamports(match_account.pot_lamports)?;
+        if protocol_fee_lamports > 0 {
+            transfer_lamports_from_program_account(
+                &match_account.to_account_info(),
+                &ctx.accounts.admin.to_account_info(),
+                protocol_fee_lamports,
+                8 + Match::LEN,
+            )?;
+        }
 
         match_account.status = MatchStatus::Resolved as u8;
         match_account.finalized_at_ts = Some(Clock::get()?.unix_timestamp);
@@ -387,10 +556,19 @@ pub mod ubalance_prediction_market {
             entry.buy_in_lamports
         } else {
             require!(match_account.status == MatchStatus::Resolved as u8, ErrorCode::InvalidState);
-            require!(entry.is_winner, ErrorCode::NotWinningPosition);
+            require!(entry.result_recorded, ErrorCode::MatchResultsIncomplete);
+            require!(
+                entry.score == match_account.highest_score,
+                ErrorCode::NotWinningPosition
+            );
             require!(match_account.winner_count > 0, ErrorCode::NoWinnersRecorded);
-            match_account
+            let protocol_fee_lamports = calculate_protocol_fee_lamports(match_account.pot_lamports)?;
+            let distributable_pot = match_account
                 .pot_lamports
+                .checked_sub(protocol_fee_lamports)
+                .ok_or(error!(ErrorCode::MathOverflow))?;
+            require!(distributable_pot > 0, ErrorCode::NoPayoutAvailable);
+            distributable_pot
                 .checked_div(match_account.winner_count as u64)
                 .ok_or(error!(ErrorCode::MathOverflow))?
         };
@@ -480,6 +658,73 @@ pub mod ubalance_prediction_market {
         require!(amount_lamports > 0, ErrorCode::InvalidAmount);
         require_keys_eq!(market.admin, bankroll.admin, ErrorCode::Unauthorized);
         require!(bankroll.active, ErrorCode::BankrollInactive);
+        require_keys_eq!(round.market, market.key(), ErrorCode::InvalidDuelRound);
+        require!(round.status == RoundStatus::Predicting as u8, ErrorCode::InvalidState);
+        require!(clock.unix_timestamp < round.close_at_ts, ErrorCode::RoundClosed);
+
+        duel.admin = market.admin;
+        duel.market = market.key();
+        duel.round = round.key();
+        duel.player = player.key();
+        duel.duel_id = duel_id;
+        duel.turn_count = 0;
+        duel.total_amount_lamports = 0;
+        duel.pot_lamports = 0;
+        duel.turn_player_sides = [AI_DUEL_SIDE_UNSET; MAX_AI_DUEL_TURNS];
+        duel.turn_ai_revealed_sides = [AI_DUEL_SIDE_UNSET; MAX_AI_DUEL_TURNS];
+        duel.turn_amount_lamports = [0; MAX_AI_DUEL_TURNS];
+        duel.turn_ai_commitments = [[0u8; 32]; MAX_AI_DUEL_TURNS];
+        duel.status = DuelStatus::Open as u8;
+        duel.outcome = None;
+        duel.player_payout_lamports = 0;
+        duel.player_claimed = false;
+        duel.opened_at_ts = clock.unix_timestamp;
+        duel.settled_at_ts = None;
+
+        let transfer_context = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            Transfer {
+                from: player.to_account_info(),
+                to: duel.to_account_info(),
+            },
+        );
+        transfer(transfer_context, amount_lamports)?;
+
+        transfer_lamports_between_program_accounts(
+            &bankroll.to_account_info(),
+            &duel.to_account_info(),
+            amount_lamports,
+            8 + HouseBankroll::LEN,
+        )?;
+
+        append_ai_duel_turn_state(duel, player_side, amount_lamports, ai_commitment)?;
+
+        Ok(())
+    }
+
+    pub fn append_ai_duel_turn(
+        ctx: Context<AppendAiDuelTurn>,
+        duel_id: u64,
+        player_side: DecisionSide,
+        amount_lamports: u64,
+        ai_commitment: [u8; 32],
+    ) -> Result<()> {
+        let clock = Clock::get()?;
+        let market = &ctx.accounts.market;
+        let round = &ctx.accounts.round;
+        let player = &ctx.accounts.player;
+        let bankroll = &ctx.accounts.house_bankroll;
+        let duel = &mut ctx.accounts.ai_duel;
+
+        require!(amount_lamports > 0, ErrorCode::InvalidAmount);
+        require!(duel.status == DuelStatus::Open as u8, ErrorCode::InvalidState);
+        require!(duel.duel_id == duel_id, ErrorCode::InvalidDuelTurn);
+        require_keys_eq!(duel.market, market.key(), ErrorCode::InvalidDuelMarket);
+        require_keys_eq!(duel.round, round.key(), ErrorCode::InvalidDuelRound);
+        require_keys_eq!(duel.player, player.key(), ErrorCode::Unauthorized);
+        require_keys_eq!(market.admin, bankroll.admin, ErrorCode::Unauthorized);
+        require!(bankroll.active, ErrorCode::BankrollInactive);
+        require_keys_eq!(round.market, market.key(), ErrorCode::InvalidDuelRound);
         require!(round.status == RoundStatus::Predicting as u8, ErrorCode::InvalidState);
         require!(clock.unix_timestamp < round.close_at_ts, ErrorCode::RoundClosed);
 
@@ -499,22 +744,7 @@ pub mod ubalance_prediction_market {
             8 + HouseBankroll::LEN,
         )?;
 
-        duel.admin = market.admin;
-        duel.market = market.key();
-        duel.round = round.key();
-        duel.player = player.key();
-        duel.duel_id = duel_id;
-        duel.player_side = player_side;
-        duel.amount_lamports = amount_lamports;
-        duel.pot_lamports = amount_lamports.saturating_mul(2);
-        duel.ai_commitment = ai_commitment;
-        duel.ai_revealed_side = None;
-        duel.status = DuelStatus::Open as u8;
-        duel.outcome = None;
-        duel.player_payout_lamports = 0;
-        duel.player_claimed = false;
-        duel.opened_at_ts = clock.unix_timestamp;
-        duel.settled_at_ts = None;
+        append_ai_duel_turn_state(duel, player_side, amount_lamports, ai_commitment)?;
 
         Ok(())
     }
@@ -530,30 +760,35 @@ pub mod ubalance_prediction_market {
         require_keys_eq!(market.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
         require_keys_eq!(duel.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
         require!(duel.status == DuelStatus::Open as u8, ErrorCode::InvalidState);
+        require!(duel.turn_count == 1, ErrorCode::LegacyInstructionDisabled);
 
+        let player_side = decision_side_from_u8(duel.turn_player_sides[0])?;
+        let amount_lamports = duel.turn_amount_lamports[0];
         let side_u8 = decision_side_to_u8(&ai_side);
-        let duel_id_le = duel.duel_id.to_le_bytes();
-        let hash = hashv(&[
-            AI_DUEL_COMMIT_DOMAIN,
-            &duel_id_le,
-            duel.player.as_ref(),
-            duel.market.as_ref(),
-            duel.round.as_ref(),
-            &[side_u8],
+        let hash = hash_ai_duel_turn_commitment(
+            duel,
+            0,
+            &player_side,
+            amount_lamports,
+            &ai_side,
             &nonce,
-        ]);
+        );
 
         require!(
-            duel.ai_commitment == hash.to_bytes(),
+            duel.turn_ai_commitments[0] == hash,
             ErrorCode::AiCommitmentMismatch
         );
 
-        duel.ai_revealed_side = Some(ai_side);
+        duel.turn_ai_revealed_sides[0] = side_u8;
         duel.status = DuelStatus::Revealed as u8;
         Ok(())
     }
 
-    pub fn settle_ai_duel(ctx: Context<SettleAiDuel>) -> Result<()> {
+    pub fn settle_ai_duel(
+        ctx: Context<SettleAiDuel>,
+        ai_sides: Vec<DecisionSide>,
+        nonces: Vec<[u8; 32]>,
+    ) -> Result<()> {
         let market = &ctx.accounts.market;
         let round = &ctx.accounts.round;
         let bankroll = &ctx.accounts.house_bankroll;
@@ -562,36 +797,62 @@ pub mod ubalance_prediction_market {
         require_keys_eq!(market.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
         require_keys_eq!(duel.admin, ctx.accounts.admin.key(), ErrorCode::Unauthorized);
         require_keys_eq!(bankroll.admin, market.admin, ErrorCode::Unauthorized);
-        require!(duel.status == DuelStatus::Revealed as u8, ErrorCode::InvalidState);
+        require!(
+            duel.status == DuelStatus::Open as u8 || duel.status == DuelStatus::Revealed as u8,
+            ErrorCode::InvalidState
+        );
         require_keys_eq!(duel.market, market.key(), ErrorCode::InvalidDuelMarket);
         require_keys_eq!(duel.round, round.key(), ErrorCode::InvalidDuelRound);
         require!(round.status == RoundStatus::Resolved as u8, ErrorCode::RoundUnresolved);
+        require!(duel.turn_count > 0, ErrorCode::InvalidDuelTurn);
+
+        let expected_turn_count = duel.turn_count as usize;
+        require!(
+            ai_sides.len() == expected_turn_count && nonces.len() == expected_turn_count,
+            ErrorCode::InvalidAiRevealInput
+        );
 
         let winning_side = round
             .resolved_side
             .clone()
             .ok_or(error!(ErrorCode::RoundUnresolved))?;
-        let ai_side = duel
-            .ai_revealed_side
-            .clone()
-            .ok_or(error!(ErrorCode::AiNotRevealed))?;
 
-        let player_correct = duel.player_side == winning_side;
-        let ai_correct = ai_side == winning_side;
+        let mut player_payout_lamports: u64 = 0;
+        for turn_index in 0..expected_turn_count {
+            let player_side = decision_side_from_u8(duel.turn_player_sides[turn_index])?;
+            let amount_lamports = duel.turn_amount_lamports[turn_index];
+            let ai_side = ai_sides[turn_index].clone();
+            let nonce = nonces[turn_index];
+            let expected_commitment = hash_ai_duel_turn_commitment(
+                duel,
+                turn_index as u16,
+                &player_side,
+                amount_lamports,
+                &ai_side,
+                &nonce,
+            );
+            require!(
+                duel.turn_ai_commitments[turn_index] == expected_commitment,
+                ErrorCode::AiCommitmentMismatch
+            );
 
-        let (outcome, player_payout, house_payout) =
-            if player_correct && !ai_correct {
-                (DuelOutcome::PlayerWin, duel.pot_lamports, 0)
-            } else if ai_correct && !player_correct {
-                (DuelOutcome::HouseWin, 0, duel.pot_lamports)
-            } else {
-                // Tie/push: both sides get stake back.
-                (
-                    DuelOutcome::Push,
-                    duel.amount_lamports,
-                    duel.pot_lamports.saturating_sub(duel.amount_lamports),
-                )
-            };
+            duel.turn_ai_revealed_sides[turn_index] = decision_side_to_u8(&ai_side);
+
+            let turn_player_payout_lamports = resolve_ai_duel_turn_player_payout(
+                player_side,
+                ai_side,
+                winning_side.clone(),
+                amount_lamports,
+            )?;
+            player_payout_lamports = player_payout_lamports
+                .checked_add(turn_player_payout_lamports)
+                .ok_or(error!(ErrorCode::MathOverflow))?;
+        }
+
+        let house_payout = duel
+            .pot_lamports
+            .checked_sub(player_payout_lamports)
+            .ok_or(error!(ErrorCode::MathOverflow))?;
 
         if house_payout > 0 {
             transfer_lamports_between_program_accounts(
@@ -602,8 +863,11 @@ pub mod ubalance_prediction_market {
             )?;
         }
 
-        duel.outcome = Some(outcome);
-        duel.player_payout_lamports = player_payout;
+        duel.outcome = Some(classify_ai_duel_outcome(
+            player_payout_lamports,
+            duel.total_amount_lamports,
+        ));
+        duel.player_payout_lamports = player_payout_lamports;
         duel.status = DuelStatus::Settled as u8;
         duel.settled_at_ts = Some(Clock::get()?.unix_timestamp);
 
@@ -749,6 +1013,17 @@ impl Market {
 }
 
 #[account]
+pub struct MarketOracleConfig {
+    pub market: Pubkey,
+    pub oracle_feed_id: [u8; 32],
+    pub created_at_ts: i64,
+}
+
+impl MarketOracleConfig {
+    pub const LEN: usize = 32 + 32 + 8;
+}
+
+#[account]
 pub struct Round {
     pub market: Pubkey,
     pub number: u64,
@@ -794,12 +1069,13 @@ pub struct Match {
     pub pot_lamports: u64,
     pub winner_count: u8,
     pub highest_score: u16,
+    pub recorded_result_count: u8,
     pub created_at_ts: i64,
     pub finalized_at_ts: Option<i64>,
 }
 
 impl Match {
-    pub const LEN: usize = 192;
+    pub const LEN: usize = 193;
 }
 
 #[account]
@@ -838,11 +1114,13 @@ pub struct AIDuel {
     pub round: Pubkey,
     pub player: Pubkey,
     pub duel_id: u64,
-    pub player_side: DecisionSide,
-    pub amount_lamports: u64,
+    pub turn_count: u16,
+    pub total_amount_lamports: u64,
     pub pot_lamports: u64,
-    pub ai_commitment: [u8; 32],
-    pub ai_revealed_side: Option<DecisionSide>,
+    pub turn_player_sides: [u8; MAX_AI_DUEL_TURNS],
+    pub turn_ai_revealed_sides: [u8; MAX_AI_DUEL_TURNS],
+    pub turn_amount_lamports: [u64; MAX_AI_DUEL_TURNS],
+    pub turn_ai_commitments: [[u8; 32]; MAX_AI_DUEL_TURNS],
     pub status: u8,
     pub outcome: Option<DuelOutcome>,
     pub player_payout_lamports: u64,
@@ -852,7 +1130,24 @@ pub struct AIDuel {
 }
 
 impl AIDuel {
-    pub const LEN: usize = 256;
+    pub const LEN: usize = 32
+        + 32
+        + 32
+        + 32
+        + 8
+        + 2
+        + 8
+        + 8
+        + MAX_AI_DUEL_TURNS
+        + MAX_AI_DUEL_TURNS
+        + (MAX_AI_DUEL_TURNS * 8)
+        + (MAX_AI_DUEL_TURNS * 32)
+        + 1
+        + 2
+        + 8
+        + 1
+        + 8
+        + 9;
 }
 
 #[derive(Accounts)]
@@ -881,6 +1176,26 @@ pub struct SetMarketActive<'info> {
         bump,
     )]
     pub market: Account<'info, Market>,
+}
+
+#[derive(Accounts)]
+pub struct InitMarketOracle<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(
+        seeds = [MARKET_SEED, admin.key().as_ref(), &market.index.to_le_bytes()],
+        bump,
+    )]
+    pub market: Account<'info, Market>,
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = 8 + MarketOracleConfig::LEN,
+        seeds = [MARKET_ORACLE_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_oracle: Account<'info, MarketOracleConfig>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -960,15 +1275,21 @@ pub struct LockRound<'info> {
 
 #[derive(Accounts)]
 pub struct ResolveRound<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
     pub market: Account<'info, Market>,
+    #[account(mut, address = market.admin)]
+    pub platform_fee_receiver: SystemAccount<'info>,
+    #[account(
+        seeds = [MARKET_ORACLE_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub market_oracle: Account<'info, MarketOracleConfig>,
     #[account(
         mut,
         seeds = [ROUND_SEED, market.key().as_ref(), &round.number.to_le_bytes()],
         bump,
     )]
     pub round: Account<'info, Round>,
+    pub oracle_price_feed: Account<'info, PriceUpdateV2>,
 }
 
 #[derive(Accounts)]
@@ -1020,8 +1341,6 @@ pub struct LockMatch<'info> {
 
 #[derive(Accounts)]
 pub struct SetMatchEntryResult<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
     pub market: Account<'info, Market>,
     #[account(mut)]
     pub match_account: Account<'info, Match>,
@@ -1113,14 +1432,14 @@ pub struct WithdrawHouseBankroll<'info> {
 pub struct OpenAiDuel<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
-    pub market: Account<'info, Market>,
-    pub round: Account<'info, Round>,
+    pub market: Box<Account<'info, Market>>,
+    pub round: Box<Account<'info, Round>>,
     #[account(
         mut,
         seeds = [HOUSE_BANKROLL_SEED, market.admin.as_ref()],
         bump,
     )]
-    pub house_bankroll: Account<'info, HouseBankroll>,
+    pub house_bankroll: Box<Account<'info, HouseBankroll>>,
     #[account(
         init,
         payer = player,
@@ -1128,7 +1447,29 @@ pub struct OpenAiDuel<'info> {
         seeds = [AI_DUEL_SEED, market.key().as_ref(), player.key().as_ref(), &duel_id.to_le_bytes()],
         bump,
     )]
-    pub ai_duel: Account<'info, AIDuel>,
+    pub ai_duel: Box<Account<'info, AIDuel>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(duel_id: u64)]
+pub struct AppendAiDuelTurn<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+    pub market: Box<Account<'info, Market>>,
+    pub round: Box<Account<'info, Round>>,
+    #[account(
+        mut,
+        seeds = [HOUSE_BANKROLL_SEED, market.admin.as_ref()],
+        bump,
+    )]
+    pub house_bankroll: Box<Account<'info, HouseBankroll>>,
+    #[account(
+        mut,
+        seeds = [AI_DUEL_SEED, market.key().as_ref(), player.key().as_ref(), &duel_id.to_le_bytes()],
+        bump,
+    )]
+    pub ai_duel: Box<Account<'info, AIDuel>>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1136,25 +1477,25 @@ pub struct OpenAiDuel<'info> {
 pub struct RevealAiDuel<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
-    pub market: Account<'info, Market>,
+    pub market: Box<Account<'info, Market>>,
     #[account(mut)]
-    pub ai_duel: Account<'info, AIDuel>,
+    pub ai_duel: Box<Account<'info, AIDuel>>,
 }
 
 #[derive(Accounts)]
 pub struct SettleAiDuel<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
-    pub market: Account<'info, Market>,
-    pub round: Account<'info, Round>,
+    pub market: Box<Account<'info, Market>>,
+    pub round: Box<Account<'info, Round>>,
     #[account(
         mut,
         seeds = [HOUSE_BANKROLL_SEED, market.admin.as_ref()],
         bump,
     )]
-    pub house_bankroll: Account<'info, HouseBankroll>,
+    pub house_bankroll: Box<Account<'info, HouseBankroll>>,
     #[account(mut)]
-    pub ai_duel: Account<'info, AIDuel>,
+    pub ai_duel: Box<Account<'info, AIDuel>>,
 }
 
 #[derive(Accounts)]
@@ -1162,7 +1503,7 @@ pub struct ClaimAiDuelPayout<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
     #[account(mut)]
-    pub ai_duel: Account<'info, AIDuel>,
+    pub ai_duel: Box<Account<'info, AIDuel>>,
 }
 
 #[delegate]
@@ -1208,6 +1549,8 @@ pub enum ErrorCode {
     InvalidState,
     #[msg("Round already closed")]
     RoundClosed,
+    #[msg("Round has not reached close time")]
+    RoundNotClosedYet,
     #[msg("Invalid amount")]
     InvalidAmount,
     #[msg("Invalid market name length")]
@@ -1256,18 +1599,54 @@ pub enum ErrorCode {
     NoWinnersRecorded,
     #[msg("Invalid match entry")]
     InvalidMatchEntry,
+    #[msg("Invalid match market")]
+    InvalidMatchMarket,
+    #[msg("Invalid scoring accounts")]
+    InvalidScoringAccounts,
+    #[msg("Invalid scoring round")]
+    InvalidScoringRound,
+    #[msg("Invalid scoring position")]
+    InvalidScoringPosition,
+    #[msg("Duplicate scoring round")]
+    DuplicateScoringRound,
+    #[msg("Too many scoring rounds")]
+    TooManyScoringRounds,
+    #[msg("Match results are incomplete")]
+    MatchResultsIncomplete,
+    #[msg("Match results are already complete")]
+    MatchResultsComplete,
     #[msg("Already claimed")]
     AlreadyClaimed,
     #[msg("House bankroll inactive")]
     BankrollInactive,
     #[msg("AI commitment mismatch")]
     AiCommitmentMismatch,
+    #[msg("Invalid AI reveal input")]
+    InvalidAiRevealInput,
     #[msg("AI side has not been revealed")]
     AiNotRevealed,
+    #[msg("Too many AI duel turns")]
+    TooManyAiDuelTurns,
+    #[msg("Invalid AI duel turn")]
+    InvalidDuelTurn,
+    #[msg("Legacy AI duel instruction is disabled for multi-turn duels")]
+    LegacyInstructionDisabled,
     #[msg("Invalid duel market")]
     InvalidDuelMarket,
     #[msg("Invalid duel round")]
     InvalidDuelRound,
+    #[msg("Market oracle config has already been initialized with a different feed")]
+    MarketOracleAlreadyInitialized,
+    #[msg("Invalid market oracle config")]
+    InvalidMarketOracle,
+    #[msg("Oracle price is unavailable")]
+    OraclePriceUnavailable,
+    #[msg("Oracle publish time is before round close")]
+    OraclePublishBeforeRoundClose,
+    #[msg("Oracle publish time is too far after round close")]
+    OraclePublishTooLate,
+    #[msg("Oracle price is invalid")]
+    OracleInvalidPrice,
     #[msg("Invalid PDA for account type")]
     InvalidPdaForAccountType,
 }
@@ -1378,10 +1757,152 @@ fn transfer_lamports_between_program_accounts(
     Ok(())
 }
 
+fn calculate_protocol_fee_lamports(total_pool_lamports: u64) -> Result<u64> {
+    let fee_u128 = (total_pool_lamports as u128)
+        .checked_mul(PROTOCOL_FEE_BPS as u128)
+        .ok_or(error!(ErrorCode::MathOverflow))?
+        .checked_div(BPS_DENOMINATOR as u128)
+        .ok_or(error!(ErrorCode::MathOverflow))?;
+    u64::try_from(fee_u128).map_err(|_| error!(ErrorCode::MathOverflow))
+}
+
+fn normalize_oracle_price_to_internal_units(price: i64, expo: i32) -> Result<u64> {
+    require!(price > 0, ErrorCode::OracleInvalidPrice);
+    let raw = u128::try_from(price).map_err(|_| error!(ErrorCode::OracleInvalidPrice))?;
+
+    let scaled = if expo > SETTLEMENT_PRICE_SCALE_EXPONENT {
+        let exponent_delta: u32 = (expo - SETTLEMENT_PRICE_SCALE_EXPONENT)
+            .try_into()
+            .map_err(|_| error!(ErrorCode::MathOverflow))?;
+        let multiplier = 10u128
+            .checked_pow(exponent_delta)
+            .ok_or(error!(ErrorCode::MathOverflow))?;
+        raw.checked_mul(multiplier)
+            .ok_or(error!(ErrorCode::MathOverflow))?
+    } else if expo < SETTLEMENT_PRICE_SCALE_EXPONENT {
+        let exponent_delta: u32 = (SETTLEMENT_PRICE_SCALE_EXPONENT - expo)
+            .try_into()
+            .map_err(|_| error!(ErrorCode::MathOverflow))?;
+        let divisor = 10u128
+            .checked_pow(exponent_delta)
+            .ok_or(error!(ErrorCode::MathOverflow))?;
+        raw.checked_div(divisor)
+            .ok_or(error!(ErrorCode::MathOverflow))?
+    } else {
+        raw
+    };
+
+    u64::try_from(scaled).map_err(|_| error!(ErrorCode::MathOverflow))
+}
+
 fn decision_side_to_u8(side: &DecisionSide) -> u8 {
     match side {
         DecisionSide::Yes => 0,
         DecisionSide::No => 1,
         DecisionSide::Skip => 2,
+    }
+}
+
+fn decision_side_from_u8(raw: u8) -> Result<DecisionSide> {
+    match raw {
+        0 => Ok(DecisionSide::Yes),
+        1 => Ok(DecisionSide::No),
+        2 => Ok(DecisionSide::Skip),
+        _ => Err(error!(ErrorCode::InvalidDuelTurn)),
+    }
+}
+
+fn append_ai_duel_turn_state(
+    duel: &mut AIDuel,
+    player_side: DecisionSide,
+    amount_lamports: u64,
+    ai_commitment: [u8; 32],
+) -> Result<()> {
+    let turn_index = duel.turn_count as usize;
+    require!(
+        turn_index < MAX_AI_DUEL_TURNS,
+        ErrorCode::TooManyAiDuelTurns
+    );
+
+    duel.turn_player_sides[turn_index] = decision_side_to_u8(&player_side);
+    duel.turn_ai_revealed_sides[turn_index] = AI_DUEL_SIDE_UNSET;
+    duel.turn_amount_lamports[turn_index] = amount_lamports;
+    duel.turn_ai_commitments[turn_index] = ai_commitment;
+
+    duel.turn_count = duel
+        .turn_count
+        .checked_add(1)
+        .ok_or(error!(ErrorCode::MathOverflow))?;
+    duel.total_amount_lamports = duel
+        .total_amount_lamports
+        .checked_add(amount_lamports)
+        .ok_or(error!(ErrorCode::MathOverflow))?;
+    duel.pot_lamports = duel
+        .pot_lamports
+        .checked_add(
+            amount_lamports
+                .checked_mul(2)
+                .ok_or(error!(ErrorCode::MathOverflow))?,
+        )
+        .ok_or(error!(ErrorCode::MathOverflow))?;
+    Ok(())
+}
+
+fn hash_ai_duel_turn_commitment(
+    duel: &AIDuel,
+    turn_index: u16,
+    player_side: &DecisionSide,
+    amount_lamports: u64,
+    ai_side: &DecisionSide,
+    nonce: &[u8; 32],
+) -> [u8; 32] {
+    let duel_id_le = duel.duel_id.to_le_bytes();
+    let turn_index_le = turn_index.to_le_bytes();
+    let player_side_raw = decision_side_to_u8(player_side);
+    let ai_side_raw = decision_side_to_u8(ai_side);
+    let amount_lamports_le = amount_lamports.to_le_bytes();
+
+    hashv(&[
+        AI_DUEL_COMMIT_DOMAIN,
+        &duel_id_le,
+        duel.player.as_ref(),
+        duel.market.as_ref(),
+        duel.round.as_ref(),
+        &turn_index_le,
+        &[player_side_raw],
+        &amount_lamports_le,
+        &[ai_side_raw],
+        nonce,
+    ])
+    .to_bytes()
+}
+
+fn resolve_ai_duel_turn_player_payout(
+    player_side: DecisionSide,
+    ai_side: DecisionSide,
+    winning_side: DecisionSide,
+    amount_lamports: u64,
+) -> Result<u64> {
+    let player_correct = player_side == winning_side;
+    let ai_correct = ai_side == winning_side;
+
+    if player_correct && !ai_correct {
+        amount_lamports
+            .checked_mul(2)
+            .ok_or(error!(ErrorCode::MathOverflow))
+    } else if ai_correct && !player_correct {
+        Ok(0)
+    } else {
+        Ok(amount_lamports)
+    }
+}
+
+fn classify_ai_duel_outcome(player_payout_lamports: u64, total_stake_lamports: u64) -> DuelOutcome {
+    if player_payout_lamports > total_stake_lamports {
+        DuelOutcome::PlayerWin
+    } else if player_payout_lamports < total_stake_lamports {
+        DuelOutcome::HouseWin
+    } else {
+        DuelOutcome::Push
     }
 }

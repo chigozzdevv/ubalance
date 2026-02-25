@@ -1,12 +1,14 @@
 import { market_seed_data } from "@/features/markets/markets.data";
 import type { market } from "@/features/markets/markets.model";
 import type { chain_admin_service } from "@/features/chain/chain-admin.service";
+import type { oracle_service } from "@/features/oracle/oracle.service";
 import type { market_document, mongo_service } from "@/shared/mongo";
 
 export class markets_service {
   constructor(
     private readonly mongo: mongo_service,
-    private readonly chain_admin: chain_admin_service
+    private readonly chain_admin: chain_admin_service,
+    private readonly oracle: oracle_service
   ) {}
 
   async bootstrap(): Promise<void> {
@@ -53,6 +55,11 @@ export class markets_service {
         market_index: market_item.market_index,
         display_name: market_item.display_name,
         timeframe_minutes: market_item.timeframe_minutes
+      });
+      const oracle_feed_id_hex = await this.oracle.get_feed_id(market_item.oracle_symbol);
+      await this.chain_admin.ensure_market_oracle_initialized({
+        market_index: market_item.market_index,
+        oracle_feed_id_hex
       });
       await this.mongo.markets_collection.updateOne(
         { slug: market_item.slug },

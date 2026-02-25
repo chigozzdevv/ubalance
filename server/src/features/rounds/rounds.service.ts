@@ -7,7 +7,7 @@ import type {
 import type { markets_service } from "@/features/markets/markets.service";
 import type { market } from "@/features/markets/markets.model";
 import type { oracle_service } from "@/features/oracle/oracle.service";
-import { to_lamports_price, type chain_admin_service } from "@/features/chain/chain-admin.service";
+import type { chain_admin_service } from "@/features/chain/chain-admin.service";
 import type { decision_side, round_action, round_view } from "@/features/rounds/rounds.model";
 import { env } from "@/config/env";
 
@@ -544,18 +544,24 @@ export class rounds_service {
         if (!market_document) {
           throw new app_error(`market not found for round ${row.id}`, 404);
         }
-
-        const settlement_price = await this.oracle_service.get_price_near_timestamp(
-          market_document.oracle_symbol,
-          Number(row.close_at_ms)
-        );
-        const winning_side = this.determine_winning_side(Number(row.reference_price), settlement_price);
+        const oracle_price_feed = this.get_oracle_price_feed_or_throw(market_document.oracle_symbol);
 
         const resolve_tx_signature = await this.chain_admin.resolve_round({
           market_index: Number(market_document.market_index),
           round_number: Number(row.round_number),
-          settlement_price
+          oracle_price_feed
         });
+
+        const snapshot = await this.chain_admin.get_round_snapshot({
+          market_index: Number(market_document.market_index),
+          round_number: Number(row.round_number)
+        });
+        if (!snapshot || snapshot.status !== "resolved" || snapshot.settlement_price === null || !snapshot.winning_side) {
+          throw new app_error("resolved round snapshot is unavailable", 502);
+        }
+
+        const settlement_price = Number(snapshot.settlement_price);
+        const winning_side = snapshot.winning_side;
 
         const updated_at_ms = Date.now();
         await this.mongo.rounds_collection.updateOne(
@@ -692,17 +698,39 @@ export class rounds_service {
     };
   }
 
-  private determine_winning_side(reference_price: number, settlement_price: number): decision_side {
-    const normalized_reference_price = to_lamports_price(reference_price);
-    const normalized_settlement_price = to_lamports_price(settlement_price);
-
-    if (normalized_settlement_price > normalized_reference_price) {
-      return "yes";
+  private get_oracle_price_feed_or_throw(oracle_symbol: string): string {
+    const normalized = oracle_symbol.trim().toUpperCase();
+    if (normalized === "CRYPTO.BTC/USD") {
+      if (!env.PYTH_PRICE_ACCOUNT_BTC_USD) {
+        throw new app_error("PYTH_PRICE_ACCOUNT_BTC_USD is not configured", 500);
+      }
+      return env.PYTH_PRICE_ACCOUNT_BTC_USD;
     }
-    if (normalized_settlement_price < normalized_reference_price) {
-      return "no";
+    if (normalized === "CRYPTO.ETH/USD") {
+      if (!env.PYTH_PRICE_ACCOUNT_ETH_USD) {
+        throw new app_error("PYTH_PRICE_ACCOUNT_ETH_USD is not configured", 500);
+      }
+      return env.PYTH_PRICE_ACCOUNT_ETH_USD;
     }
-    return "skip";
+    if (normalized === "CRYPTO.SOL/USD") {
+      if (!env.PYTH_PRICE_ACCOUNT_SOL_USD) {
+        throw new app_error("PYTH_PRICE_ACCOUNT_SOL_USD is not configured", 500);
+      }
+      return env.PYTH_PRICE_ACCOUNT_SOL_USD;
+    }
+    if (normalized === "CRYPTO.BNB/USD") {
+      if (!env.PYTH_PRICE_ACCOUNT_BNB_USD) {
+        throw new app_error("PYTH_PRICE_ACCOUNT_BNB_USD is not configured", 500);
+      }
+      return env.PYTH_PRICE_ACCOUNT_BNB_USD;
+    }
+    if (normalized === "CRYPTO.XRP/USD") {
+      if (!env.PYTH_PRICE_ACCOUNT_XRP_USD) {
+        throw new app_error("PYTH_PRICE_ACCOUNT_XRP_USD is not configured", 500);
+      }
+      return env.PYTH_PRICE_ACCOUNT_XRP_USD;
+    }
+    throw new app_error(`unsupported oracle symbol for round resolution: ${oracle_symbol}`, 400);
   }
 
   private async get_market_index(market_slug: string): Promise<number> {

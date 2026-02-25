@@ -40,7 +40,7 @@ Lifecycle loop in `server/src/features/rounds/rounds.service.ts`:
 1. `ensure_predicting_rounds`: creates/recovers predicting rounds.
 2. `lock_expired_rounds`: when `close_at_ms` passes:
    lock uses base RPC, but first tries ER `commit_and_undelegate` if the round is delegated.
-3. `resolve_expired_rounds`: after `ROUND_RESOLVE_DELAY_SECONDS`, fetches oracle settlement price and resolves on-chain.
+3. `resolve_expired_rounds`: after `ROUND_RESOLVE_DELAY_SECONDS`, resolves on-chain using a verified Pyth receiver `PriceUpdateV2` account plus per-market feed config (no admin settlement price input).
 4. Round document is updated in Mongo with signatures and final winning side.
 
 ### 3) User prediction flow
@@ -101,6 +101,7 @@ Core instructions:
 
 - `initialize_market`
 - `set_market_active`
+- `init_market_oracle`
 - `open_round`
 - `place_prediction`
 - `claim_payout`
@@ -108,7 +109,7 @@ Core instructions:
 - `resolve_round`
 - `create_match`, `join_match`, `lock_match`, `set_match_entry_result`, `finalize_match`, `cancel_match`, `claim_match_payout`
 - `init_house_bankroll`, `set_house_bankroll_active`, `fund_house_bankroll`, `withdraw_house_bankroll`
-- `open_ai_duel`, `reveal_ai_duel`, `settle_ai_duel`, `claim_ai_duel_payout`
+- `open_ai_duel`, `append_ai_duel_turn`, `reveal_ai_duel` (legacy), `settle_ai_duel`, `claim_ai_duel_payout`
 - `delegate_pda`
 - `commit_round`
 - `commit_and_undelegate_round`
@@ -117,9 +118,12 @@ Core instructions:
 Important behavior:
 
 - `place_prediction` transfers user lamports into the round account for `yes/no`.
-- `claim_payout` pays winners pro-rata from the pooled `yes/no` stake.
-- PvP ties split the match pot across top-score winners.
-- PvAI uses OpenAI-driven side selection from live market/round context and commit-reveal before settlement.
+- `claim_payout` pays winners pro-rata from pooled `yes/no` stake after a 2.5% protocol fee.
+- PvP `set_match_entry_result` computes scores on-chain from provided `(round, position)` account pairs; no score or winner flag is passed in instruction data.
+- PvP match payouts are split from pot after a 2.5% protocol fee.
+- `resolve_round` reads settlement directly from oracle update account + market feed config, and can be triggered permissionlessly.
+- PvAI supports turn chaining (`human -> AI -> human -> AI`) until round close by appending turns to a single duel.
+- PvAI settlement verifies commit-reveal for every recorded turn in a single settle transaction after round resolution.
 
 ## API Overview
 
@@ -173,6 +177,8 @@ Protected PvAI routes:
 - `POST /ai-duels/house/active` (admin wallet)
 - `POST /ai-duels/open/relay-prepare`
 - `POST /ai-duels/:duelId/open`
+- `POST /ai-duels/:duelId/turns/relay-prepare`
+- `POST /ai-duels/:duelId/turns`
 - `POST /ai-duels/:duelId/reveal-settle` (admin wallet)
 - `POST /ai-duels/:duelId/claims/relay-prepare`
 - `POST /ai-duels/:duelId/claims`
@@ -280,6 +286,20 @@ OPENAI_TIMEOUT_MS=12000
 AI_MODEL_MIN_CONFIDENCE=0.55
 AI_MODEL_DECISION_RETRIES=2
 AI_DUEL_MAX_STAKE_LAMPORTS=50000000
+AI_DUEL_MAX_TOTAL_OPEN_EXPOSURE_LAMPORTS=2000000000
+AI_DUEL_MAX_MARKET_OPEN_EXPOSURE_LAMPORTS=1000000000
+AI_DUEL_MAX_ROUND_OPEN_EXPOSURE_LAMPORTS=400000000
+AI_DUEL_MAX_WALLET_OPEN_EXPOSURE_LAMPORTS=250000000
+AI_DUEL_MAX_OPEN_DUELS_COUNT=1000
+AI_DUEL_MAX_WALLET_OPEN_DUELS_COUNT=30
+AI_DUEL_MAX_TURNS_PER_DUEL=32
+AI_DUEL_REQUIRED_BANKROLL_COVERAGE_BPS=12000
+AI_DUEL_PREPARED_TTL_SECONDS=180
+PYTH_PRICE_ACCOUNT_BTC_USD=
+PYTH_PRICE_ACCOUNT_ETH_USD=
+PYTH_PRICE_ACCOUNT_SOL_USD=
+PYTH_PRICE_ACCOUNT_BNB_USD=
+PYTH_PRICE_ACCOUNT_XRP_USD=
 AUTH_CHALLENGE_TTL_SECONDS=300
 AUTH_SESSION_TTL_SECONDS=86400
 ```
