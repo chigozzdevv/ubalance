@@ -57,6 +57,16 @@ export const MatchLobby = ({
     const [submitting, set_submitting] = useState(false);
     const [skipped_round_ids, set_skipped_round_ids] = useState<Set<string>>(new Set());
 
+    const [is_creating, set_is_creating] = useState(false);
+    const [create_timeframe_minutes, set_create_timeframe_minutes] = useState<number>(markets[0]?.timeframe_minutes || 1);
+    const [create_buy_in, set_create_buy_in] = useState("0.1");
+    const [create_players, set_create_players] = useState("10");
+    const [create_hours, set_create_hours] = useState("24");
+    const [create_access_mode, set_create_access_mode] = useState<"public" | "private">("public");
+    const [create_join_code, set_create_join_code] = useState("");
+    const [join_match_target, set_join_match_target] = useState<match_view | null>(null);
+    const [join_code_input, set_join_code_input] = useState("");
+
     const active_queue = active_match
         ? rounds
             .filter(r => !skipped_round_ids.has(r.id))
@@ -143,7 +153,53 @@ export const MatchLobby = ({
         );
     };
 
-    const join_match = async (match: match_view) => {
+    const submit_create_match = async () => {
+        set_submitting(true);
+        try {
+            const token = await ensure_wallet_and_auth();
+            if (!token) return;
+            const market_slug = markets.find(m => m.timeframe_minutes === create_timeframe_minutes)?.slug;
+            if (!market_slug) throw new Error("Invalid market selection");
+
+            const lamports = Math.round(parseFloat(create_buy_in) * 1_000_000_000);
+            const players = parseInt(create_players, 10);
+            const duration_ms = parseFloat(create_hours) * 60 * 60 * 1000;
+            const now = Date.now();
+
+            set_status("creating match on server...");
+            await matches_api.create_match(
+                market_slug,
+                lamports,
+                players,
+                now,
+                now + duration_ms,
+                token,
+                {
+                    access_mode: create_access_mode,
+                    join_code: create_access_mode === "private" ? create_join_code : undefined
+                }
+            );
+
+            set_status("match created successfully!");
+            set_is_creating(false);
+            await load_matches();
+        } catch (error: any) {
+            set_status(error.message || "failed to create match");
+        } finally {
+            set_submitting(false);
+        }
+    };
+
+    const trigger_join_match = (match: match_view) => {
+        if (match.requiresJoinCode) {
+            set_join_match_target(match);
+            set_join_code_input("");
+        } else {
+            void join_match(match, "");
+        }
+    };
+
+    const join_match = async (match: match_view, join_code?: string) => {
         set_submitting(true);
         try {
             const token = await ensure_wallet_and_auth();
@@ -156,7 +212,7 @@ export const MatchLobby = ({
             for (let attempt = 1; attempt <= relay_max_attempts; attempt += 1) {
                 try {
                     set_status("preparing join tx...");
-                    const prepared = await matches_api.prepare_join_relay(match.id, token);
+                    const prepared = await matches_api.prepare_join_relay(match.id, token, { join_code });
 
                     set_status("awaiting wallet signature...");
                     const unsigned_tx = Transaction.from(decode_base64(prepared.data.transactionBase64));
@@ -196,9 +252,10 @@ export const MatchLobby = ({
             }
 
             set_status("syncing with server...");
-            const updated_match = await matches_api.confirm_join(match.id, tx_signature, token);
+            const updated_match = await matches_api.confirm_join(match.id, tx_signature, token, { join_code });
 
             set_active_match(updated_match.data);
+            set_join_match_target(null);
             set_status("joined match!");
             await load_matches();
         } catch (error: any) {
@@ -300,8 +357,126 @@ export const MatchLobby = ({
                 )}
             </div>
 
-            {!active_match && (
+            {join_match_target && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4 backdrop-blur-sm">
+                    <div className="flex flex-col gap-4 w-full max-w-[320px] p-6 rounded-[2rem] border border-[#1e2422] bg-[#0b0f0e]">
+                        <div className="text-[#e7efe9] font-bold text-xl mb-2 text-center">Private Match</div>
+                        <p className="text-sm text-[#9eaba4] text-center mb-2">This match requires a join code.</p>
+                        <input
+                            type="text"
+                            placeholder="Enter Join Code"
+                            value={join_code_input}
+                            onChange={(e) => set_join_code_input(e.target.value)}
+                            className="bg-[#111513] border border-[#1e2422] rounded-xl p-3 text-sm text-[#e7efe9] outline-none text-center font-mono focus:border-[#b9f6c9]/50"
+                        />
+                        <div className="flex gap-3 w-full mt-2">
+                            <button type="button" onClick={() => set_join_match_target(null)} disabled={submitting} className="flex-1 py-3 rounded-xl border border-[#1e2422] text-[#9eaba4] font-bold text-sm hover:bg-[#1e2422]">
+                                Cancel
+                            </button>
+                            <button type="button" onClick={() => void join_match(join_match_target, join_code_input)} disabled={submitting || !join_code_input} className="flex-1 py-3 rounded-xl bg-[#b9f6c9] text-[#0a1611] font-bold text-sm hover:bg-white disabled:opacity-50">
+                                Join
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {is_creating && !active_match && (
+                <div className="flex flex-col gap-4 w-full max-w-[360px] mx-auto p-5 rounded-[1.5rem] border border-[#1e2422] bg-[#111513]">
+                    <div className="text-[#e7efe9] font-bold text-lg mb-2">Create Match</div>
+
+                    <div className="flex gap-3 w-full">
+                        <div className="flex flex-col gap-1 w-1/2">
+                            <label className="text-xs text-[#9eaba4]">Timeframe</label>
+                            <select
+                                value={create_timeframe_minutes}
+                                onChange={e => set_create_timeframe_minutes(parseInt(e.target.value, 10))}
+                                className="bg-[#0b0f0e] border border-[#1e2422] rounded-xl p-3 text-sm text-[#e7efe9] outline-none"
+                            >
+                                {markets.map(m => (
+                                    <option key={m.slug} value={m.timeframe_minutes}>{m.timeframe_minutes}m</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div className="flex flex-col gap-1 w-1/2">
+                            <label className="text-xs text-[#9eaba4]">Mode</label>
+                            <select
+                                value={create_access_mode}
+                                onChange={e => set_create_access_mode(e.target.value as "public" | "private")}
+                                className="bg-[#0b0f0e] border border-[#1e2422] rounded-xl p-3 text-sm text-[#e7efe9] outline-none"
+                            >
+                                <option value="public">Public</option>
+                                <option value="private">Private</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div className="flex gap-3 w-full">
+                        <div className="flex flex-col gap-1 w-1/2">
+                            <label className="text-xs text-[#9eaba4]">Buy-in (SOL)</label>
+                            <input
+                                type="number"
+                                step="0.01"
+                                value={create_buy_in}
+                                onChange={e => set_create_buy_in(e.target.value)}
+                                className="bg-[#0b0f0e] border border-[#1e2422] rounded-xl p-3 text-sm text-[#e7efe9] outline-none focus:border-[#89eeb0]"
+                            />
+                        </div>
+                        <div className="flex flex-col gap-1 w-1/2">
+                            <label className="text-xs text-[#9eaba4]">Players</label>
+                            <input
+                                type="number"
+                                value={create_players}
+                                onChange={e => set_create_players(e.target.value)}
+                                className="bg-[#0b0f0e] border border-[#1e2422] rounded-xl p-3 text-sm text-[#e7efe9] outline-none focus:border-[#89eeb0]"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="flex flex-col gap-1 w-full">
+                        <label className="text-xs text-[#9eaba4]">Duration (Hours)</label>
+                        <input
+                            type="number"
+                            step="1"
+                            value={create_hours}
+                            onChange={e => set_create_hours(e.target.value)}
+                            className="bg-[#0b0f0e] border border-[#1e2422] rounded-xl p-3 text-sm text-[#e7efe9] outline-none focus:border-[#89eeb0]"
+                        />
+                    </div>
+
+                    {create_access_mode === "private" && (
+                        <div className="flex flex-col gap-1 w-full">
+                            <label className="text-xs text-[#9eaba4]">Join Code</label>
+                            <input
+                                type="text"
+                                value={create_join_code}
+                                onChange={e => set_create_join_code(e.target.value)}
+                                placeholder="e.g. secret-alpha"
+                                className="bg-[#0b0f0e] border border-[#1e2422] rounded-xl p-3 text-sm font-mono text-[#e7efe9] outline-none focus:border-[#89eeb0]"
+                            />
+                        </div>
+                    )}
+
+                    <div className="flex gap-3 w-full mt-4">
+                        <button type="button" onClick={() => set_is_creating(false)} disabled={submitting} className="flex-1 py-3 rounded-xl border border-[#1e2422] text-[#9eaba4] font-bold text-sm hover:bg-[#1e2422]">
+                            Cancel
+                        </button>
+                        <button type="button" onClick={() => void submit_create_match()} disabled={submitting || (create_access_mode === "private" && !create_join_code)} className="flex-1 py-3 rounded-xl bg-[#b9f6c9] text-[#0a1611] font-bold text-sm hover:bg-white disabled:opacity-50">
+                            Create
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {!active_match && !is_creating && (
                 <div className="w-full flex-col flex gap-4">
+                    <button
+                        type="button"
+                        onClick={() => set_is_creating(true)}
+                        className="w-full max-w-[360px] mx-auto h-12 rounded-xl border border-[#b9f6c9]/30 text-[#89eeb0] font-bold text-sm hover:bg-[#b9f6c9]/10 transition-colors"
+                    >
+                        + Create Match
+                    </button>
                     {matches.map(match => {
                         const time_left = get_relative_time(match.endAtMs);
                         return (
@@ -318,12 +493,19 @@ export const MatchLobby = ({
                                 </div>
 
                                 <div className="flex justify-between items-center w-full mt-2">
-                                    <div className="text-xs text-[#9eaba4] opacity-80">
-                                        Ends {time_left}
+                                    <div className="flex flex-col gap-1">
+                                        <div className="text-xs text-[#9eaba4] opacity-80">
+                                            Ends {time_left}
+                                        </div>
+                                        {match.accessMode === "private" && (
+                                            <div className="text-[10px] text-yellow-500 bg-yellow-500/10 px-1.5 py-0.5 rounded-md inline-block max-w-min">
+                                                Private
+                                            </div>
+                                        )}
                                     </div>
                                     <button
                                         type="button"
-                                        onClick={() => void join_match(match)}
+                                        onClick={() => trigger_join_match(match)}
                                         disabled={submitting || match.playerCount >= match.maxPlayers}
                                         className="px-4 py-2 rounded-xl bg-[#b9f6c9] text-[#0a1611] font-bold text-sm hover:bg-white disabled:opacity-50 transition-colors"
                                     >
